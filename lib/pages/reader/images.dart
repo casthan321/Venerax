@@ -38,60 +38,144 @@ class _ReaderImagesState extends State<_ReaderImages> {
   void load() async {
     if (inProgress) return;
     inProgress = true;
-    if (reader.type == ComicType.local ||
-        (LocalManager().isDownloaded(
+    final localManager = LocalManager();
+    final isLocalComic = reader.type == ComicType.local;
+    final hasDownloadedChapter =
+        !isLocalComic &&
+        localManager.isDownloaded(
           reader.cid,
           reader.type,
           reader.chapter,
           reader.widget.chapters,
-        ))) {
+        );
+    if (isLocalComic || hasDownloadedChapter) {
+      List<String>? images;
+      Object? localLoadError;
+      StackTrace? localLoadStackTrace;
+      var directoryDefinitelyMissing = false;
       try {
-        var images = await LocalManager().getImages(
+        images = await localManager.getImages(
           reader.cid,
           reader.type,
           reader.chapter,
         );
-        setState(() {
-          reader.images = images;
-          reader.isLoading = false;
-          inProgress = false;
-          _handleJumpToLastPage();
-          Future.microtask(() {
-            reader.updateHistory();
-          });
-        });
-      } catch (e) {
-        setState(() {
-          error = e.toString();
-          reader.isLoading = false;
-          inProgress = false;
-        });
+      } on LocalComicDirectoryMissingException catch (e, stackTrace) {
+        directoryDefinitelyMissing = true;
+        localLoadError = e;
+        localLoadStackTrace = stackTrace;
+      } catch (e, stackTrace) {
+        localLoadError = e;
+        localLoadStackTrace = stackTrace;
       }
+      if (!mounted) return;
+
+      final invalidation = !isLocalComic && hasDownloadedChapter
+          ? classifyDownloadedContentInvalidation(
+              hasChapters: reader.widget.chapters != null,
+              directoryDefinitelyMissing: directoryDefinitelyMissing,
+              enumerationCompleted: localLoadError == null && images != null,
+              imageCount: images?.length ?? 0,
+            )
+          : DownloadedContentInvalidation.none;
+      if (invalidation != DownloadedContentInvalidation.none) {
+        final reason =
+            localLoadError ??
+            const FileSystemException(
+              'Downloaded chapter contains no supported images',
+            );
+        Log.error(
+          'Reader',
+          'Downloaded ${invalidation.name} is unavailable: $reason',
+          localLoadStackTrace,
+        );
+        localManager.invalidateDownloadedContent(
+          reader.cid,
+          reader.type,
+          reader.chapter,
+        );
+        await _loadFromNetwork();
+        if (mounted) {
+          context.readerScaffold.update();
+        }
+        return;
+      }
+
+      if (localLoadError != null || images == null || images.isEmpty) {
+        final loadError =
+            localLoadError ??
+            const FileSystemException(
+              'Local comic contains no supported images',
+            );
+        if (localLoadError != null) {
+          Log.error(
+            'Reader',
+            'Local comic storage is temporarily unavailable: $loadError',
+            localLoadStackTrace,
+          );
+        }
+        setState(() {
+          error = loadError.toString();
+          reader.isLoading = false;
+          inProgress = false;
+        });
+        return;
+      }
+
+      setState(() {
+        reader.images = images!;
+        reader.isLoading = false;
+        inProgress = false;
+        _handleJumpToLastPage();
+        reader._page = clampReaderPage(reader.page, reader.maxPage);
+        Future.microtask(() {
+          reader.updateHistory();
+        });
+      });
     } else {
-      var cp = reader.widget.chapters?.ids.elementAtOrNull(reader.chapter - 1);
-      var res = await reader.type.comicSource!.loadComicPages!(
-        reader.widget.cid,
-        cp,
+      await _loadFromNetwork();
+    }
+    if (mounted) {
+      context.readerScaffold.update();
+    }
+  }
+
+  Future<void> _loadFromNetwork() async {
+    try {
+      final cp = reader.widget.chapters?.ids.elementAtOrNull(
+        reader.chapter - 1,
+      );
+      final source = reader.type.comicSource;
+      if (source?.loadComicPages == null) {
+        throw StateError('Comic source is unavailable');
+      }
+      final res = await runReaderChapterLoad(
+        () => source!.loadComicPages!(reader.widget.cid, cp),
       );
       if (res.error) {
-        setState(() {
-          error = res.errorMessage;
-          reader.isLoading = false;
-          inProgress = false;
-        });
-      } else {
-        setState(() {
-          reader.images = res.data;
-          reader.isLoading = false;
-          inProgress = false;
-          _handleJumpToLastPage();
-          Future.microtask(() {
-            reader.updateHistory();
-          });
-        });
+        throw res.errorMessage ?? 'Failed to load comic pages';
       }
+      if (res.data.isEmpty) {
+        throw 'Comic source returned an empty image list';
+      }
+      if (!mounted) return;
+      setState(() {
+        reader.images = res.data;
+        reader.isLoading = false;
+        inProgress = false;
+        _handleJumpToLastPage();
+        reader._page = clampReaderPage(reader.page, reader.maxPage);
+        Future.microtask(() {
+          reader.updateHistory();
+        });
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        error = e.toString();
+        reader.isLoading = false;
+        inProgress = false;
+      });
     }
-    context.readerScaffold.update();
   }
 
   @override
@@ -201,6 +285,10 @@ class _GalleryModeState extends State<_GalleryMode>
 
   int fingers = 0;
 
+  double _galleryDragDelta = 0;
+
+  bool _blockGallerySwipe = false;
+
   @override
   void initState() {
     reader = context.reader;
@@ -282,11 +370,74 @@ class _GalleryModeState extends State<_GalleryMode>
     );
   }
 
+  void _onGalleryDragStart(DragStartDetails details) {
+    _galleryDragDelta = 0;
+  }
+
+  void _onGalleryDragUpdate(DragUpdateDetails details) {
+    _galleryDragDelta += details.primaryDelta ?? 0;
+  }
+
+  void _onGalleryDragCancel() {
+    _galleryDragDelta = 0;
+  }
+
+  void _onGalleryDragEnd(
+    DragEndDetails details, {
+    required double viewportExtent,
+    required bool reverse,
+  }) {
+    final dragDelta = _galleryDragDelta;
+    _galleryDragDelta = 0;
+    if (_blockGallerySwipe || isLongPressing) {
+      return;
+    }
+
+    final intent = resolveGallerySwipeIntent(
+      dragDelta: dragDelta,
+      primaryVelocity: details.primaryVelocity ?? 0,
+      viewportExtent: viewportExtent,
+      reverse: reverse,
+    );
+    switch (intent) {
+      case GallerySwipeIntent.previous:
+        if (!reader.toPrevPage() && !reader.isFirstChapterOfGroup) {
+          reader.toPrevChapter(toLastPage: true);
+        }
+        return;
+      case GallerySwipeIntent.next:
+        if (!reader.toNextPage() && !reader.isLastChapterOfGroup) {
+          reader.toNextChapter();
+        }
+        return;
+      case null:
+        return;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Listener(
+    final enablePageAnimation = reader.enablePageAnimation(
+      reader.cid,
+      reader.type,
+    );
+    final reverse = reader.mode == ReaderMode.galleryRightToLeft;
+    final scrollAxis = reader.mode == ReaderMode.galleryTopToBottom
+        ? Axis.vertical
+        : Axis.horizontal;
+    final viewportSize = MediaQuery.sizeOf(context);
+    final viewportExtent = scrollAxis == Axis.horizontal
+        ? viewportSize.width
+        : viewportSize.height;
+    final gallery = Listener(
       onPointerDown: (event) {
+        if (fingers == 0) {
+          _blockGallerySwipe = false;
+        }
         fingers++;
+        if (fingers > 1) {
+          _blockGallerySwipe = true;
+        }
       },
       onPointerUp: (event) {
         fingers--;
@@ -305,10 +456,11 @@ class _GalleryModeState extends State<_GalleryMode>
       },
       child: PhotoViewGallery.builder(
         backgroundDecoration: BoxDecoration(color: context.colorScheme.surface),
-        reverse: reader.mode == ReaderMode.galleryRightToLeft,
-        scrollDirection: reader.mode == ReaderMode.galleryTopToBottom
-            ? Axis.vertical
-            : Axis.horizontal,
+        reverse: reverse,
+        scrollDirection: scrollAxis,
+        scrollPhysics: enablePageAnimation
+            ? null
+            : const NeverScrollableScrollPhysics(),
         itemCount: totalPages + 2,
         builder: (BuildContext context, int index) {
           if (index == 0 || index == totalPages + 1) {
@@ -382,7 +534,8 @@ class _GalleryModeState extends State<_GalleryMode>
         },
         onPageChanged: (i) {
           if (i == 0) {
-            if (reader.isFirstChapterOfGroup || !reader.toPrevChapter(toLastPage: true)) {
+            if (reader.isFirstChapterOfGroup ||
+                !reader.toPrevChapter(toLastPage: true)) {
               controller.jumpToPage(1);
             }
           } else if (i == totalPages + 1) {
@@ -406,6 +559,49 @@ class _GalleryModeState extends State<_GalleryMode>
           }
         },
       ),
+    );
+
+    if (enablePageAnimation) {
+      return gallery;
+    }
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      dragStartBehavior: DragStartBehavior.down,
+      supportedDevices: ScrollConfiguration.of(context).dragDevices,
+      onHorizontalDragStart: scrollAxis == Axis.horizontal
+          ? _onGalleryDragStart
+          : null,
+      onHorizontalDragUpdate: scrollAxis == Axis.horizontal
+          ? _onGalleryDragUpdate
+          : null,
+      onHorizontalDragEnd: scrollAxis == Axis.horizontal
+          ? (details) => _onGalleryDragEnd(
+              details,
+              viewportExtent: viewportExtent,
+              reverse: reverse,
+            )
+          : null,
+      onHorizontalDragCancel: scrollAxis == Axis.horizontal
+          ? _onGalleryDragCancel
+          : null,
+      onVerticalDragStart: scrollAxis == Axis.vertical
+          ? _onGalleryDragStart
+          : null,
+      onVerticalDragUpdate: scrollAxis == Axis.vertical
+          ? _onGalleryDragUpdate
+          : null,
+      onVerticalDragEnd: scrollAxis == Axis.vertical
+          ? (details) => _onGalleryDragEnd(
+              details,
+              viewportExtent: viewportExtent,
+              reverse: false,
+            )
+          : null,
+      onVerticalDragCancel: scrollAxis == Axis.vertical
+          ? _onGalleryDragCancel
+          : null,
+      child: gallery,
     );
   }
 
@@ -514,6 +710,7 @@ class _GalleryModeState extends State<_GalleryMode>
     if (!appdata.settings['enableLongPressToZoom'] || fingers != 1) {
       return;
     }
+    _blockGallerySwipe = true;
     var photoViewController = photoViewControllers[reader.page]!;
     double target = photoViewController.getInitialScale!.call()! * 1.75;
     var size = reader.size;
@@ -681,19 +878,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   int get preCacheCount => appdata.settings["preloadImageCount"];
 
-  /// Whether the user was scrolling the page.
-  /// The gesture detector has a delay to detect tap event.
-  /// To handle the tap event, we need to know if the user was scrolling before the delay.
-  bool delayedIsScrolling = false;
+  final _scrollTapGuard = ScrollTapGuard();
 
   var imageStates = <State<ComicImage>>{};
-
-  void delayedSetIsScrolling(bool value) {
-    Future.delayed(
-      const Duration(milliseconds: 300),
-      () => delayedIsScrolling = value,
-    );
-  }
 
   bool prepareToPrevChapter = false;
   bool prepareToNextChapter = false;
@@ -719,6 +906,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
   @override
   void dispose() {
     itemPositionsListener.itemPositions.removeListener(onPositionChanged);
+    _scrollTapGuard.dispose();
     super.dispose();
   }
 
@@ -973,9 +1161,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
     widget = NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (notification is ScrollStartNotification) {
-          delayedSetIsScrolling(true);
+          _scrollTapGuard.onScrollStart();
         } else if (notification is ScrollEndNotification) {
-          delayedSetIsScrolling(false);
+          _scrollTapGuard.onScrollEnd();
         }
 
         var scale = photoViewController.scale ?? 1.0;
@@ -1094,7 +1282,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   void handleLongPressDown(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom'] || delayedIsScrolling) {
+    if (!appdata.settings['enableLongPressToZoom'] ||
+        _scrollTapGuard.shouldIgnoreTap) {
       return;
     }
     double target = photoViewController.getInitialScale!.call()! * 1.75;
@@ -1182,10 +1371,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   bool handleOnTap(Offset location) {
-    if (delayedIsScrolling) {
-      return true;
-    }
-    return false;
+    return _scrollTapGuard.shouldIgnoreTap;
   }
 
   @override
@@ -1225,7 +1411,9 @@ ImageProvider _createImageProviderFromKey(
     reader.cid,
     reader.eid,
     reader.page,
-    enableResize: reader.mode.isContinuous, // For continuous mode, we need to resize the image to improve performance
+    enableResize: reader
+        .mode
+        .isContinuous, // For continuous mode, we need to resize the image to improve performance
   );
 }
 

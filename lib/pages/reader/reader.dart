@@ -26,12 +26,18 @@ import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/global_state.dart';
 import 'package:venera/foundation/history.dart';
+import 'package:venera/foundation/image_favorite_support.dart';
 import 'package:venera/foundation/image_provider/cached_image.dart';
 import 'package:venera/foundation/image_provider/reader_image.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/images.dart';
+import 'package:venera/pages/reader/fullscreen_transition.dart';
+import 'package:venera/pages/reader/gallery_swipe.dart';
+import 'package:venera/pages/reader/page_animation_guard.dart';
+import 'package:venera/pages/reader/reader_chapter_load.dart';
+import 'package:venera/pages/reader/scroll_tap_guard.dart';
 import 'package:venera/pages/settings/settings_page.dart';
 import 'package:venera/utils/clipboard_image.dart';
 import 'package:venera/utils/data_sync.dart';
@@ -270,6 +276,7 @@ class _ReaderState extends State<Reader>
 
   @override
   void dispose() {
+    disposeReaderLocation();
     if (isFullscreen) {
       fullscreen();
     }
@@ -415,7 +422,7 @@ abstract mixin class _ImagePerPageHandler {
   late int _lastImagesPerPage;
 
   late bool _lastOrientation;
-  
+
   /// Track if we were on the chapter comments page before orientation change
   bool _wasOnCommentsPage = false;
 
@@ -430,13 +437,13 @@ abstract mixin class _ImagePerPageHandler {
   String get cid;
 
   ComicType get type;
-  
+
   /// Whether the current page is the chapter comments page
   bool get isOnChapterCommentsPage;
-  
+
   /// Get the max page (excluding comments page)
   int get maxPage;
-  
+
   /// Get images list for calculating maxPage
   List<String>? get images;
 
@@ -478,7 +485,7 @@ abstract mixin class _ImagePerPageHandler {
           1;
     }
   }
-  
+
   /// Calculate maxPage with a specific imagesPerPage value
   int _calcMaxPage(int imagesPerPageValue) {
     if (images == null) return 1;
@@ -498,7 +505,7 @@ abstract mixin class _ImagePerPageHandler {
       // if we were on the comments page before the orientation change
       int oldMaxPage = _calcMaxPage(_lastImagesPerPage);
       _wasOnCommentsPage = page > oldMaxPage;
-      
+
       _adjustPageForImagesPerPageChange(
         _lastImagesPerPage,
         currentImagesPerPage,
@@ -537,7 +544,7 @@ abstract mixin class _ImagePerPageHandler {
 
     // Clamp to valid range (1 to maxPage)
     newPage = newPage.clamp(1, maxPage);
-    
+
     // If we were on the comments page, stay on the comments page
     if (_wasOnCommentsPage) {
       page = maxPage + 1;
@@ -629,7 +636,9 @@ abstract mixin class _ReaderLocation {
 
   void setPage(int page) {
     // Prevent page change during animation
-    if (_animationCount > 0 && _pendingPage != null && page != _pendingPage) {
+    if (_pageAnimationGuard.isAnimating &&
+        _pendingPage != null &&
+        page != _pendingPage) {
       return;
     }
     this.page = page;
@@ -649,26 +658,37 @@ abstract mixin class _ReaderLocation {
     return toPage(page - 1);
   }
 
-  int _animationCount = 0;
+  static const _pageAnimationTimeout = Duration(seconds: 1);
 
-  bool toPage(int page) {
+  final _pageAnimationGuard = PageAnimationGuard();
+  bool _readerLocationDisposed = false;
+
+  void disposeReaderLocation() {
+    _readerLocationDisposed = true;
+    _pageAnimationGuard.cancel();
+    _pendingPage = null;
+  }
+
+  bool toPage(int page, {bool animate = true}) {
     if (_validatePage(page)) {
       if (page == this.page && page != 1 && page != totalPages) {
         return false;
       }
-      final hasAnimation = enablePageAnimation(cid, type);
+      final hasAnimation =
+          animate &&
+          enablePageAnimation(cid, type) &&
+          !_pageAnimationGuard.isAnimating;
       if (hasAnimation) {
         _pendingPage = page;
-        _animationCount++;
+        final animationToken = _pageAnimationGuard.start();
         update();
-        _imageViewController!.animateToPage(page).then((_) {
-          _animationCount--;
-          if (_pendingPage == page) {
-            _pendingPage = null;
-          }
-          update();
-        });
+        unawaited(_runPageAnimation(page, animationToken));
       } else {
+        // A second request must not enter scrollable_positioned_list's
+        // re-entrant scrollTo path. A direct jump also supersedes any stale
+        // controller Future that may never complete.
+        _pageAnimationGuard.cancel();
+        _pendingPage = null;
         this.page = page;
         update();
         _imageViewController!.toPage(page);
@@ -678,7 +698,68 @@ abstract mixin class _ReaderLocation {
     return false;
   }
 
-  bool get isPageAnimating => _animationCount > 0;
+  Future<void> _runPageAnimation(int page, int animationToken) async {
+    var animationFailed = false;
+    var timedOutBeforeControllerSettled = false;
+    try {
+      final animation = _imageViewController!.animateToPage(page);
+      unawaited(
+        animation.then<void>(
+          (_) {
+            if (timedOutBeforeControllerSettled) {
+              _settleLatePageAnimation();
+            }
+          },
+          onError: (Object _, StackTrace __) {
+            if (timedOutBeforeControllerSettled) {
+              _settleLatePageAnimation();
+            }
+          },
+        ),
+      );
+      await animation.timeout(_pageAnimationTimeout);
+    } catch (error, stackTrace) {
+      animationFailed = true;
+      timedOutBeforeControllerSettled = error is TimeoutException;
+      Log.error('Reader page animation', error, stackTrace);
+    } finally {
+      final tokenReleased = _pageAnimationGuard.finish(animationToken);
+      if (tokenReleased) {
+        if (_pendingPage == page) {
+          _pendingPage = null;
+        }
+        if (!_readerLocationDisposed) {
+          final fallbackTarget = failedPageAnimationFallbackTarget(
+            animationFailed: animationFailed,
+            tokenReleased: tokenReleased,
+            isDisposed: _readerLocationDisposed,
+            targetPage: page,
+          );
+          if (fallbackTarget != null && _validatePage(fallbackTarget)) {
+            this.page = fallbackTarget;
+            _imageViewController?.toPage(fallbackTarget);
+          }
+          update();
+        }
+      } else if (!_readerLocationDisposed && _pendingPage == null) {
+        // A distant scrollable_positioned_list animation can have a queued
+        // post-frame phase that starts after jumpTo. Re-apply the newer
+        // logical page once the stale animation has actually settled.
+        _imageViewController?.toPage(this.page);
+      }
+    }
+  }
+
+  void _settleLatePageAnimation() {
+    if (_readerLocationDisposed ||
+        _pageAnimationGuard.isAnimating ||
+        _pendingPage != null) {
+      return;
+    }
+    _imageViewController?.toPage(page);
+  }
+
+  bool get isPageAnimating => _pageAnimationGuard.isAnimating;
 
   bool _validateChapter(int chapter) {
     return chapter >= 1 && chapter <= maxChapter;
@@ -697,6 +778,8 @@ abstract mixin class _ReaderLocation {
 
   bool toChapter(int c, {bool toLastPage = false}) {
     if (_validateChapter(c) && !isLoading) {
+      _pageAnimationGuard.cancel();
+      _pendingPage = null;
       chapter = c;
       page = 1;
       _jumpToLastPageOnLoad = toLastPage;
@@ -744,10 +827,15 @@ mixin class _ReaderWindow {
 
   void fullscreen() async {
     if (!App.isDesktop) return;
-    await windowManager.hide();
-    await windowManager.setFullScreen(!isFullscreen);
-    await windowManager.show();
-    isFullscreen = !isFullscreen;
+    final targetFullscreen = !isFullscreen;
+    await runFullscreenTransition(
+      isMacOS: App.isMacOS,
+      targetFullscreen: targetFullscreen,
+      hideWindow: windowManager.hide,
+      setFullScreen: windowManager.setFullScreen,
+      showWindow: windowManager.show,
+    );
+    isFullscreen = targetFullscreen;
     WindowFrame.of(App.rootContext).setWindowFrame(!isFullscreen);
   }
 

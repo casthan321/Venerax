@@ -1,4 +1,4 @@
-<p>A comic reader that support reading local and network comics.</p>
+<p>Venera Community is an independent, community-maintained fork of the archived open-source Venera comic reader. It uses a separate Android application ID, so it can be installed alongside the official app.</p>
 <h3>Features</h3>
 <ul>
 <li>Read local comics</li>

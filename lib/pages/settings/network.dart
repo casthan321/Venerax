@@ -46,56 +46,59 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
   String port = '';
   String username = '';
   String password = '';
+  String scheme = 'http';
+  String? manualProxyError;
 
-  // USERNAME:PASSWORD@HOST:PORT
+  String _formatProxyError(Object error) {
+    if (error is FormatException) {
+      return error.message.toString();
+    }
+    return 'Invalid manual proxy';
+  }
+
+  // Percent-encoded USERNAME:PASSWORD@HOST:PORT.
   String toProxyStr() {
     if (type == 'direct') {
       return 'direct';
     } else if (type == 'system') {
       return 'system';
     }
-    var res = '';
-    if (username.isNotEmpty) {
-      res += username;
-      if (password.isNotEmpty) {
-        res += ':$password';
-      }
-      res += '@';
-    }
-    res += host;
-    if (port.isNotEmpty) {
-      res += ':$port';
-    }
-    return res;
+    return normalizeManualWebviewProxySetting(
+      scheme: scheme,
+      host: host,
+      port: port,
+      username: username,
+      password: password,
+    );
   }
 
-  void parseProxyString(String proxy) {
-    if (proxy == 'direct') {
-      type = 'direct';
-      return;
-    } else if (proxy == 'system') {
-      type = 'system';
-      return;
-    }
-    type = 'manual';
-    var parts = proxy.split('@');
-    if (parts.length == 2) {
-      var auth = parts[0].split(':');
-      if (auth.length == 2) {
-        username = auth[0];
-        password = auth[1];
-      }
-      parts = parts[1].split(':');
-      if (parts.length == 2) {
-        host = parts[0];
-        port = parts[1];
-      }
-    } else {
-      parts = proxy.split(':');
-      if (parts.length == 2) {
-        host = parts[0];
-        port = parts[1];
-      }
+  void parseProxyString(Object? proxy) {
+    final config = resolveWebviewProxyConfigurationOrSystem(
+      setting: proxy,
+      platform: WebviewProxyPlatform.other,
+      onInvalid: (error, stackTrace) {
+        // Never log [proxy], because the legacy setting may include a password.
+        Log.error(
+          'Proxy settings',
+          'Invalid saved proxy setting; showing system proxy: $error',
+          stackTrace,
+        );
+      },
+    );
+    switch (config.mode) {
+      case WebviewProxyMode.direct:
+        type = 'direct';
+        return;
+      case WebviewProxyMode.system:
+        type = 'system';
+        return;
+      case WebviewProxyMode.manual:
+        type = 'manual';
+        scheme = config.proxyScheme ?? 'http';
+        host = config.proxyHost ?? '';
+        port = config.hasExplicitPort ? config.proxyPort!.toString() : '';
+        username = config.credentials?.username ?? '';
+        password = config.credentials?.password ?? '';
     }
   }
 
@@ -116,6 +119,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
           onChanged: (v) {
             setState(() {
               type = v ?? type;
+              manualProxyError = null;
             });
             if (type != 'manual') {
               appdata.settings['proxy'] = toProxyStr();
@@ -124,18 +128,9 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
           },
           child: Column(
             children: [
-              RadioListTile<String>(
-                title: Text("Direct".tl),
-                value: 'direct',
-              ),
-              RadioListTile<String>(
-                title: Text("System".tl),
-                value: 'system',
-              ),
-              RadioListTile(
-                title: Text("Manual".tl),
-                value: 'manual',
-              ),
+              RadioListTile<String>(title: Text("Direct".tl), value: 'direct'),
+              RadioListTile<String>(title: Text("System".tl), value: 'system'),
+              RadioListTile(title: Text("Manual".tl), value: 'manual'),
               if (type == 'manual') buildManualProxy(),
             ],
           ),
@@ -161,8 +156,13 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               host = v;
             },
             validator: (v) {
-              if (v?.isEmpty ?? false) {
+              if (v?.trim().isEmpty ?? true) {
                 return "Host cannot be empty".tl;
+              }
+              try {
+                normalizeManualWebviewProxySetting(host: v!);
+              } catch (error) {
+                return _formatProxyError(error).tl;
               }
               return null;
             },
@@ -181,8 +181,12 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               if (v?.isEmpty ?? true) {
                 return null;
               }
-              if (int.tryParse(v!) == null) {
+              final parsedPort = int.tryParse(v!);
+              if (parsedPort == null) {
                 return "Port must be a number".tl;
+              }
+              if (parsedPort < 1 || parsedPort > 65535) {
+                return "Proxy port must be between 1 and 65535".tl;
               }
               return null;
             },
@@ -206,6 +210,9 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
           ),
           const SizedBox(height: 8),
           TextFormField(
+            obscureText: true,
+            enableSuggestions: false,
+            autocorrect: false,
             decoration: InputDecoration(
               border: const OutlineInputBorder(),
               labelText: "Password".tl,
@@ -215,13 +222,27 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               password = v;
             },
           ),
+          if (manualProxyError != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              manualProxyError!.tl,
+              style: TextStyle(color: context.colorScheme.error),
+            ),
+          ],
           const SizedBox(height: 16),
           FilledButton(
             onPressed: () {
               if (formKey.currentState?.validate() ?? false) {
-                appdata.settings['proxy'] = toProxyStr();
-                appdata.saveData();
-                App.rootContext.pop();
+                try {
+                  final normalizedSetting = toProxyStr();
+                  appdata.settings['proxy'] = normalizedSetting;
+                  appdata.saveData();
+                  App.rootContext.pop();
+                } catch (error) {
+                  setState(() {
+                    manualProxyError = _formatProxyError(error);
+                  });
+                }
               }
             },
             child: Text("Save".tl),
@@ -248,7 +269,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
       if (entry.key is String && entry.value is String) {
         overrides.add((
           TextEditingController(text: entry.key),
-          TextEditingController(text: entry.value)
+          TextEditingController(text: entry.value),
         ));
       }
     }
@@ -278,10 +299,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               title: "Enable DNS Overrides".tl,
               settingKey: "enableDnsOverrides",
             ),
-            _SwitchSetting(
-              title: "Server Name Indication",
-              settingKey: "sni",
-            ),
+            _SwitchSetting(title: "Server Name Indication", settingKey: "sni"),
             const SizedBox(height: 8),
             Container(
               height: 1,
@@ -293,8 +311,10 @@ class __DNSOverridesState extends State<_DNSOverrides> {
             TextButton.icon(
               onPressed: () {
                 setState(() {
-                  overrides
-                      .add((TextEditingController(), TextEditingController()));
+                  overrides.add((
+                    TextEditingController(),
+                    TextEditingController(),
+                  ));
                 });
               },
               icon: const Icon(Icons.add),
@@ -314,15 +334,9 @@ class __DNSOverridesState extends State<_DNSOverrides> {
       margin: EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
         border: Border(
-          bottom: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
-          left: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
-          right: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
+          bottom: BorderSide(color: context.colorScheme.outlineVariant),
+          left: BorderSide(color: context.colorScheme.outlineVariant),
+          right: BorderSide(color: context.colorScheme.outlineVariant),
         ),
       ),
       child: Row(
@@ -336,10 +350,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               controller: entry.$1,
             ).paddingHorizontal(8),
           ),
-          Container(
-            width: 1,
-            color: context.colorScheme.outlineVariant,
-          ),
+          Container(width: 1, color: context.colorScheme.outlineVariant),
           Expanded(
             child: TextField(
               decoration: InputDecoration(
@@ -349,10 +360,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               controller: entry.$2,
             ).paddingHorizontal(8),
           ),
-          Container(
-            width: 1,
-            color: context.colorScheme.outlineVariant,
-          ),
+          Container(width: 1, color: context.colorScheme.outlineVariant),
           IconButton(
             icon: const Icon(Icons.delete_outline),
             onPressed: () {

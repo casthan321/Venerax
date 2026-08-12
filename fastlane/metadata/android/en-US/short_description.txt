@@ -1,1 +1,1 @@
-A comic reader that support reading local and network comics.
+A community-maintained comic reader for local and network libraries.

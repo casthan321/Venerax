@@ -9,7 +9,9 @@ import 'package:url_launcher/url_launcher_string.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/network/proxy.dart';
+import 'package:venera/pages/webview_proxy.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/translations.dart';
 import 'dart:io' as io;
@@ -53,22 +55,23 @@ extension WebviewExtension on InAppWebViewController {
 }
 
 class AppWebview extends StatefulWidget {
-  const AppWebview(
-      {required this.initialUrl,
-      this.onTitleChange,
-      this.onNavigation,
-      this.singlePage = false,
-      this.onStarted,
-      this.onLoadStop,
-      super.key});
+  const AppWebview({
+    required this.initialUrl,
+    this.onTitleChange,
+    this.onNavigation,
+    this.singlePage = false,
+    this.onStarted,
+    this.onLoadStop,
+    super.key,
+  });
 
   final String initialUrl;
 
   final void Function(String title, InAppWebViewController controller)?
-      onTitleChange;
+  onTitleChange;
 
   final bool Function(String url, InAppWebViewController controller)?
-      onNavigation;
+  onNavigation;
 
   final void Function(InAppWebViewController controller)? onStarted;
 
@@ -89,25 +92,63 @@ class _AppWebviewState extends State<AppWebview> {
 
   double _progress = 0;
 
-  late var future = _createWebviewEnvironment();
+  late final WebviewProxyConfiguration _proxyConfiguration;
+
+  late final WebviewProxyPlatform _proxyPlatform;
+
+  late final Future<bool> future;
+
+  @override
+  void initState() {
+    super.initState();
+    _proxyPlatform = App.isWindows
+        ? WebviewProxyPlatform.windows
+        : App.isAndroid
+        ? WebviewProxyPlatform.android
+        : WebviewProxyPlatform.other;
+    _proxyConfiguration = resolveWebviewProxyConfigurationOrSystem(
+      setting: appdata.settings['proxy'],
+      platform: _proxyPlatform,
+      onInvalid: (error, stackTrace) {
+        // Do not include the setting in logs: it may contain a password.
+        Log.error(
+          'WebView proxy',
+          'Invalid proxy setting; using the system proxy: $error',
+          stackTrace,
+        );
+      },
+    );
+    future = _createWebviewEnvironment();
+  }
 
   Future<bool> _createWebviewEnvironment() async {
-    var proxy = appdata.settings['proxy'].toString();
-    if (proxy != "system" && proxy != "direct") {
-      var proxyAvailable = await WebViewFeature.isFeatureSupported(
+    if (_proxyConfiguration.androidAction != AndroidWebviewProxyAction.none) {
+      final proxyAvailable = await WebViewFeature.isFeatureSupported(
         WebViewFeature.PROXY_OVERRIDE,
       );
       if (proxyAvailable) {
-        ProxyController proxyController = ProxyController.instance();
-        await proxyController.clearProxyOverride();
-        if (!proxy.contains("://")) {
-          proxy = "http://$proxy";
+        final proxyController = ProxyController.instance();
+        switch (_proxyConfiguration.androidAction) {
+          case AndroidWebviewProxyAction.clear:
+            await proxyController.clearProxyOverride();
+            break;
+          case AndroidWebviewProxyAction.direct:
+            await proxyController.setProxyOverride(
+              settings: ProxySettings(
+                directs: _proxyConfiguration.androidDirects,
+              ),
+            );
+            break;
+          case AndroidWebviewProxyAction.manual:
+            await proxyController.setProxyOverride(
+              settings: ProxySettings(
+                proxyRules: [ProxyRule(url: _proxyConfiguration.proxyUrl!)],
+              ),
+            );
+            break;
+          case AndroidWebviewProxyAction.none:
+            break;
         }
-        await proxyController.setProxyOverride(
-          settings: ProxySettings(
-            proxyRules: [ProxyRule(url: proxy)],
-          ),
-        );
       }
     }
     if (!App.isWindows) {
@@ -116,6 +157,7 @@ class _AppWebviewState extends State<AppWebview> {
     AppWebview.webViewEnvironment = await WebViewEnvironment.create(
       settings: WebViewEnvironmentSettings(
         userDataFolder: "${App.dataPath}\\webview",
+        additionalBrowserArguments: _proxyConfiguration.windowsBrowserArguments,
       ),
     );
     return true;
@@ -129,32 +171,29 @@ class _AppWebviewState extends State<AppWebview> {
         child: IconButton(
           icon: const Icon(Icons.more_horiz),
           onPressed: () {
-            showMenuX(
-              context,
-              Offset(context.width, context.padding.top),
-              [
-                MenuEntry(
-                  icon: Icons.open_in_browser,
-                  text: "Open in browser".tl,
-                  onClick: () async =>
-                      launchUrlString((await controller?.getUrl())!.toString()),
+            showMenuX(context, Offset(context.width, context.padding.top), [
+              MenuEntry(
+                icon: Icons.open_in_browser,
+                text: "Open in browser".tl,
+                onClick: () async =>
+                    launchUrlString((await controller?.getUrl())!.toString()),
+              ),
+              MenuEntry(
+                icon: Icons.copy,
+                text: "Copy link".tl,
+                onClick: () async => Clipboard.setData(
+                  ClipboardData(text: (await controller?.getUrl())!.toString()),
                 ),
-                MenuEntry(
-                  icon: Icons.copy,
-                  text: "Copy link".tl,
-                  onClick: () async => Clipboard.setData(ClipboardData(
-                      text: (await controller?.getUrl())!.toString())),
-                ),
-                MenuEntry(
-                  icon: Icons.refresh,
-                  text: "Reload".tl,
-                  onClick: () => controller?.reload(),
-                ),
-              ],
-            );
+              ),
+              MenuEntry(
+                icon: Icons.refresh,
+                text: "Reload".tl,
+                onClick: () => controller?.reload(),
+              ),
+            ]);
           },
         ),
-      )
+      ),
     ];
 
     Widget body = FutureBuilder(
@@ -166,9 +205,7 @@ class _AppWebviewState extends State<AppWebview> {
         if (!e.hasData) {
           return const SizedBox();
         }
-        return createWebviewWithEnvironment(
-          AppWebview.webViewEnvironment,
-        );
+        return createWebviewWithEnvironment(AppWebview.webViewEnvironment);
       },
     );
 
@@ -177,28 +214,24 @@ class _AppWebviewState extends State<AppWebview> {
         Positioned.fill(child: body),
         if (_progress < 1.0)
           const Positioned.fill(
-              child: Center(child: CircularProgressIndicator()))
+            child: Center(child: CircularProgressIndicator()),
+          ),
       ],
     );
 
     return Scaffold(
-        appBar: Appbar(
-          title: Text(
-            title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          actions: actions,
-        ),
-        body: body);
+      appBar: Appbar(
+        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: actions,
+      ),
+      body: body,
+    );
   }
 
   Widget createWebviewWithEnvironment(WebViewEnvironment? e) {
     return InAppWebView(
       webViewEnvironment: e,
-      initialSettings: InAppWebViewSettings(
-        isInspectable: true,
-      ),
+      initialSettings: InAppWebViewSettings(isInspectable: true),
       initialUrlRequest: URLRequest(url: WebUri(widget.initialUrl)),
       onTitleChanged: (c, t) {
         if (mounted) {
@@ -211,7 +244,7 @@ class _AppWebviewState extends State<AppWebview> {
       shouldOverrideUrlLoading: (c, r) async {
         var res =
             widget.onNavigation?.call(r.request.url?.toString() ?? "", c) ??
-                false;
+            false;
         if (res) {
           return NavigationActionPolicy.CANCEL;
         } else {
@@ -222,6 +255,31 @@ class _AppWebviewState extends State<AppWebview> {
         controller = c;
         widget.onStarted?.call(c);
       },
+      onReceivedHttpAuthRequest:
+          (App.isWindows || App.isAndroid) &&
+              _proxyConfiguration.credentials != null
+          ? (controller, challenge) async {
+              final protectionSpace = challenge.protectionSpace;
+              if (!_proxyConfiguration.matchesAuthenticationTarget(
+                platform: _proxyPlatform,
+                host: protectionSpace.host,
+                port: protectionSpace.port,
+                scheme: protectionSpace.protocol,
+              )) {
+                return null;
+              }
+              if (challenge.previousFailureCount > 1) {
+                return HttpAuthResponse(action: HttpAuthResponseAction.CANCEL);
+              }
+              final credentials = _proxyConfiguration.credentials!;
+              return HttpAuthResponse(
+                action: HttpAuthResponseAction.PROCEED,
+                username: credentials.username,
+                password: credentials.password,
+                permanentPersistence: false,
+              );
+            }
+          : null,
       onLoadStop: (c, r) {
         widget.onLoadStop?.call(c);
       },
@@ -249,12 +307,13 @@ class DesktopWebview {
 
   final void Function()? onClose;
 
-  DesktopWebview(
-      {required this.initialUrl,
-      this.onTitleChange,
-      this.onNavigation,
-      this.onStarted,
-      this.onClose});
+  DesktopWebview({
+    required this.initialUrl,
+    this.onTitleChange,
+    this.onNavigation,
+    this.onStarted,
+    this.onClose,
+  });
 
   Webview? _webview;
 
@@ -304,12 +363,13 @@ class DesktopWebview {
 
   void open() async {
     _webview = await WebviewWindow.create(
-        configuration: CreateConfiguration(
-      useWindowPositionAndSize: true,
-      userDataFolderWindows: "${App.dataPath}\\webview",
-      title: "webview",
-      proxy: await getProxy(),
-    ));
+      configuration: CreateConfiguration(
+        useWindowPositionAndSize: true,
+        userDataFolderWindows: "${App.dataPath}\\webview",
+        title: "webview",
+        proxy: await getProxy(),
+      ),
+    );
     _webview!.addOnWebMessageReceivedCallback(onMessage);
     _webview!.setOnNavigation((s) {
       s = s.substring(1, s.length - 1);

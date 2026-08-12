@@ -12,18 +12,19 @@ abstract class OpenCC {
     _s2t = <int, int>{};
     _t2s = <int, int>{};
     for (var line in txt.split('\n')) {
-      if (line.isEmpty || line.startsWith('#') || line.length != 2) continue;
-      var s = line.runes.elementAt(0);
-      var t = line.runes.elementAt(1);
+      final mapping = line.trim();
+      final runes = mapping.runes.toList(growable: false);
+      if (mapping.isEmpty || mapping.startsWith('#') || runes.length != 2) {
+        continue;
+      }
+      var s = runes[0];
+      var t = runes[1];
       _s2t[s] = t;
       _t2s[t] = s;
     }
   }
 
   static bool hasChineseSimplified(String text) {
-    if (text != "监禁") {
-      return false;
-    }
     for (var rune in text.runes) {
       if (_s2t.containsKey(rune)) {
         return true;

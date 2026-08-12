@@ -1,7 +1,8 @@
-package com.github.wgh136.venera
+package io.github.casthan321.venera
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -9,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
@@ -30,6 +32,8 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugins.GeneratedPluginRegistrant
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : FlutterFragmentActivity() {
@@ -136,6 +140,11 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
 
+                "openFolder" -> {
+                    val path = call.arguments as? String
+                    res.success(path != null && openFolder(path))
+                }
+
                 else -> res.notImplemented()
             }
         }
@@ -192,6 +201,137 @@ class MainActivity : FlutterFragmentActivity() {
             })
     }
 
+    /**
+     * Opens an Android document directory without exposing a raw file URI.
+     *
+     * ACTION_VIEW lets a capable file manager browse the exact directory. Some
+     * OEM file managers do not handle directory VIEW intents, so the system
+     * tree picker is used as a fallback with the same document as its initial
+     * location. Starting either activity is the complete MethodChannel result;
+     * no activity-result callback can complete the result a second time.
+     */
+    private fun openFolder(path: String): Boolean {
+        val documentUri = directoryDocumentUri(path) ?: return false
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(documentUri, DocumentsContract.Document.MIME_TYPE_DIR)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        if (tryStartFolderActivity(viewIntent)) {
+            return true
+        }
+
+        val pickerIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, documentUri)
+            }
+        }
+        return tryStartFolderActivity(pickerIntent)
+    }
+
+    private fun tryStartFolderActivity(intent: Intent): Boolean {
+        return try {
+            startActivity(intent)
+            true
+        } catch (error: ActivityNotFoundException) {
+            Log.w("OpenFolder", "No activity handles ${intent.action}", error)
+            false
+        } catch (error: Exception) {
+            Log.w("OpenFolder", "Failed to start ${intent.action}", error)
+            false
+        }
+    }
+
+    private fun directoryDocumentUri(path: String): Uri? {
+        if (path.startsWith(SAF_PATH_PREFIX)) {
+            return safDocumentUri(path)
+        }
+        val documentId = externalStorageDocumentId(path) ?: return null
+        return DocumentsContract.buildDocumentUri(
+            EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+            documentId
+        )
+    }
+
+    /**
+     * Maps only Android's canonical primary-storage path and conventional
+     * removable-volume mount paths. Arbitrary app paths are intentionally not
+     * reinterpreted as external-storage document IDs.
+     */
+    private fun externalStorageDocumentId(path: String): String? {
+        val canonicalPath = try {
+            File(path).canonicalPath.replace(File.separatorChar, '/')
+        } catch (error: Exception) {
+            return null
+        }
+
+        if (canonicalPath == PRIMARY_STORAGE_ROOT) {
+            return "primary:"
+        }
+        if (canonicalPath.startsWith("$PRIMARY_STORAGE_ROOT/")) {
+            return "primary:${canonicalPath.substring(PRIMARY_STORAGE_ROOT.length + 1)}"
+        }
+
+        val removable = REMOVABLE_STORAGE_PATH.matchEntire(canonicalPath)
+            ?: return null
+        val volume = removable.groupValues[1].uppercase(Locale.ROOT)
+        val relativePath = removable.groupValues[2]
+        return if (relativePath.isEmpty()) "$volume:" else "$volume:$relativePath"
+    }
+
+    /** Resolves flutter_saf's android:// document ID through our persisted tree grant. */
+    private fun safDocumentUri(path: String): Uri? {
+        val documentId = path.removePrefix(SAF_PATH_PREFIX).trimEnd('/')
+        if (!isSafeDocumentId(documentId)) {
+            return null
+        }
+
+        var selectedTree: Uri? = null
+        var selectedTreeIdLength = -1
+        for (permission in contentResolver.persistedUriPermissions) {
+            if (!permission.isReadPermission) continue
+            val treeUri = permission.uri
+            val treeId = try {
+                DocumentsContract.getTreeDocumentId(treeUri)
+            } catch (error: Exception) {
+                continue
+            }
+            if (!isSameOrDescendantDocument(treeId, documentId)) continue
+            if (treeId.length > selectedTreeIdLength) {
+                selectedTree = treeUri
+                selectedTreeIdLength = treeId.length
+            }
+        }
+
+        val treeUri = selectedTree ?: return null
+        return try {
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+        } catch (error: Exception) {
+            null
+        }
+    }
+
+    private fun isSafeDocumentId(documentId: String): Boolean {
+        if (documentId.isEmpty() || documentId.indexOf('\u0000') >= 0) return false
+        return documentId
+            .split('/')
+            .none { segment -> segment.isEmpty() || segment == "." || segment == ".." }
+    }
+
+    private fun isSameOrDescendantDocument(treeId: String, documentId: String): Boolean {
+        if (treeId.isEmpty()) return false
+        if (documentId == treeId) return true
+        return if (treeId.endsWith(':')) {
+            documentId.startsWith(treeId) && documentId.length > treeId.length
+        } else {
+            documentId.startsWith("$treeId/")
+        }
+    }
+
     private fun getProxy(): String {
         val host = System.getProperty("http.proxyHost")
         val port = System.getProperty("http.proxyPort")
@@ -230,19 +370,27 @@ class MainActivity : FlutterFragmentActivity() {
             if(plain.startsWith(externalStoragePrefix)) {
                 val path = plain.substring(externalStoragePrefix.length)
                 result.success(Environment.getExternalStorageDirectory().absolutePath + "/" + path)
+                return
             }
             // The uri cannot be parsed to plain path, use copy method
         }
         // dart:io cannot access the directory without permission.
         // so we need to copy the directory to cache directory
         val contentResolver = contentResolver
-        var tmp = cacheDir
-        var dirName = DocumentFile.fromTreeUri(this, uri)?.name
-        tmp = File(tmp, dirName!!)
-        if(tmp.exists()) {
-            tmp.deleteRecursively()
+        val safeDirName = safeDocumentName(DocumentFile.fromTreeUri(this, uri)?.name)
+        if (safeDirName == null) {
+            result.error("copy error", "Selected directory has no valid name", null)
+            return
         }
-        tmp.mkdir()
+        var tmp = File(cacheDir, safeDirName)
+        if (tmp.exists() && !tmp.deleteRecursively()) {
+            result.error("copy error", "Cannot clear the temporary directory", null)
+            return
+        }
+        if (!tmp.mkdirs() && !tmp.isDirectory) {
+            result.error("copy error", "Cannot create the temporary directory", null)
+            return
+        }
         Thread {
             try {
                 copyDirectory(contentResolver, uri, tmp)
@@ -256,15 +404,22 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private fun copyDirectory(resolver: ContentResolver, srcUri: Uri, destDir: File) {
-        val src = DocumentFile.fromTreeUri(this, srcUri) ?: return
+        val src = DocumentFile.fromTreeUri(this, srcUri)
+            ?: throw IOException("Cannot access the selected directory")
         for (file in src.listFiles()) {
+            val childName = safeDocumentName(file.name)
+                ?: throw IOException("A selected file has no valid name")
             if (file.isDirectory) {
-                val newDir = File(destDir, file.name!!)
-                newDir.mkdir()
+                val newDir = File(destDir, childName)
+                if (!newDir.mkdirs() && !newDir.isDirectory) {
+                    throw IOException("Cannot create ${newDir.path}")
+                }
                 copyDirectory(resolver, file.uri, newDir)
             } else {
-                val newFile = File(destDir, file.name!!)
-                resolver.openInputStream(file.uri)?.use { input ->
+                val newFile = File(destDir, childName)
+                val inputStream = resolver.openInputStream(file.uri)
+                    ?: throw IOException("Cannot read ${file.uri}")
+                inputStream.use { input ->
                     FileOutputStream(newFile).use { output ->
                         input.copyTo(output, bufferSize = DEFAULT_BUFFER_SIZE)
                         output.flush()
@@ -272,6 +427,12 @@ class MainActivity : FlutterFragmentActivity() {
                 }
             }
         }
+    }
+
+    private fun safeDocumentName(name: String?): String? {
+        if (name.isNullOrBlank() || name == "." || name == "..") return null
+        val fileName = File(name).name
+        return if (fileName == name) fileName else null
     }
 
     private fun hasStoragePermission(): Boolean {
@@ -401,6 +562,15 @@ class MainActivity : FlutterFragmentActivity() {
                 }
             }.start()
         }
+    }
+
+    companion object {
+        private const val SAF_PATH_PREFIX = "android://"
+        private const val PRIMARY_STORAGE_ROOT = "/storage/emulated/0"
+        private const val EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY =
+            "com.android.externalstorage.documents"
+        private val REMOVABLE_STORAGE_PATH =
+            Regex("^/storage/([0-9A-Fa-f]{4}-[0-9A-Fa-f]{4})(?:/(.*))?$")
     }
 }
 

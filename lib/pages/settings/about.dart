@@ -27,7 +27,7 @@ class _AboutSettingsState extends State<AboutSettings> {
               ),
               clipBehavior: Clip.antiAlias,
               child: const Image(
-                image: AssetImage("assets/app_icon.png"),
+                image: AssetImage("assets/app_icon_community.png"),
                 filterQuality: FilterQuality.medium,
               ),
             ),
@@ -36,11 +36,12 @@ class _AboutSettingsState extends State<AboutSettings> {
         Column(
           children: [
             const SizedBox(height: 8),
+            Text("V${App.version}", style: const TextStyle(fontSize: 16)),
             Text(
-              "V${App.version}",
-              style: const TextStyle(fontSize: 16),
+              "Venera Community is an independent, community-maintained fork of Venera."
+                  .tl,
+              textAlign: TextAlign.center,
             ),
-            Text("Venera is a free and open-source app for comic reading.".tl),
             const SizedBox(height: 8),
           ],
         ).toSliver(),
@@ -66,17 +67,17 @@ class _AboutSettingsState extends State<AboutSettings> {
           settingKey: "checkUpdateOnStart",
         ).toSliver(),
         ListTile(
-          title: const Text("Github"),
+          title: const Text("GitHub (Community Fork)"),
           trailing: const Icon(Icons.open_in_new),
           onTap: () {
-            launchUrlString("https://github.com/venera-app/venera");
+            launchUrlString("https://github.com/casthan321/venera");
           },
         ).toSliver(),
         ListTile(
-          title: const Text("Telegram"),
+          title: const Text("GitHub (Upstream)"),
           trailing: const Icon(Icons.open_in_new),
           onTap: () {
-            launchUrlString("https://t.me/venera_release");
+            launchUrlString("https://github.com/venera-app/venera");
           },
         ).toSliver(),
       ],
@@ -85,8 +86,9 @@ class _AboutSettingsState extends State<AboutSettings> {
 }
 
 Future<bool> checkUpdate() async {
-  var res = await AppDio()
-      .get("https://cdn.jsdelivr.net/gh/venera-app/venera@master/pubspec.yaml");
+  var res = await AppDio().get(
+    "https://raw.githubusercontent.com/casthan321/venera/master/pubspec.yaml",
+  );
   if (res.statusCode == 200) {
     var data = loadYaml(res.data);
     if (data["version"] != null) {
@@ -96,7 +98,10 @@ Future<bool> checkUpdate() async {
   return false;
 }
 
-Future<void> checkUpdateUi([bool showMessageIfNoUpdate = true, bool delay = false]) async {
+Future<void> checkUpdateUi([
+  bool showMessageIfNoUpdate = true,
+  bool delay = false,
+]) async {
   try {
     var value = await checkUpdate();
     if (value) {
@@ -104,26 +109,27 @@ Future<void> checkUpdateUi([bool showMessageIfNoUpdate = true, bool delay = fals
         await Future.delayed(const Duration(seconds: 2));
       }
       showDialog(
-          context: App.rootContext,
-          builder: (context) {
-            return ContentDialog(
-              title: "New version available".tl,
-              content: Text(
-                      "A new version is available. Do you want to update now?"
-                          .tl)
-                  .paddingHorizontal(16),
-              actions: [
-                Button.text(
-                  onPressed: () {
-                    Navigator.pop(context);
-                    launchUrlString(
-                        "https://github.com/venera-app/venera/releases");
-                  },
-                  child: Text("Update".tl),
-                ),
-              ],
-            );
-          });
+        context: App.rootContext,
+        builder: (context) {
+          return ContentDialog(
+            title: "New version available".tl,
+            content: Text(
+              "A new version is available. Do you want to update now?".tl,
+            ).paddingHorizontal(16),
+            actions: [
+              Button.text(
+                onPressed: () {
+                  Navigator.pop(context);
+                  launchUrlString(
+                    "https://github.com/casthan321/venera/releases",
+                  );
+                },
+                child: Text("Update".tl),
+              ),
+            ],
+          );
+        },
+      );
     } else if (showMessageIfNoUpdate) {
       App.rootContext.showMessage(message: "No new version available".tl);
     }

@@ -11,10 +11,81 @@ import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/pages/reader/reader.dart';
+import 'package:venera/utils/async_retry.dart';
 import 'package:venera/utils/io.dart';
 
 import 'app.dart';
 import 'history.dart';
+
+final class LocalComicDirectoryMissingException implements Exception {
+  const LocalComicDirectoryMissingException(this.path);
+
+  final String path;
+
+  @override
+  String toString() => 'Local comic directory does not exist: $path';
+}
+
+String? _localComicParentPath(String path) {
+  var normalized = path.replaceAll('\\', '/');
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    if (RegExp(r'^[A-Za-z]:/$').hasMatch(normalized)) break;
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+
+  final separator = normalized.lastIndexOf('/');
+  if (normalized.startsWith('android://')) {
+    // Never climb above the granted document path into the synthetic
+    // `android://` root. Its existence does not prove that this grant/storage
+    // is currently reachable.
+    if (separator < 'android://'.length) return null;
+    return normalized.substring(0, separator);
+  }
+  if (separator < 0) return null;
+  if (separator == 0) return '/';
+  if (separator == 2 && RegExp(r'^[A-Za-z]:/').hasMatch(normalized)) {
+    return normalized.substring(0, separator + 1);
+  }
+  return normalized.substring(0, separator);
+}
+
+/// Whether a missing comic/chapter path is conclusively absent rather than
+/// hidden by temporarily unavailable storage.
+///
+/// Relative comic directories belong to [configuredLibraryPath], while
+/// absolute and SAF-backed comics use their own parent. This avoids treating
+/// an unrelated, accessible library root as proof that an absolute SD/SAF path
+/// was deleted.
+Future<bool> isLocalComicDirectoryDefinitelyMissing({
+  required String comicDirectory,
+  required String comicBaseDir,
+  required String configuredLibraryPath,
+  required bool hasChapters,
+  Future<bool> Function(String path)? directoryExists,
+}) async {
+  final anchors = <String>[];
+  if (hasChapters) {
+    anchors.add(comicBaseDir);
+  }
+  final isLibraryRelative =
+      !comicDirectory.contains('/') && !comicDirectory.contains('\\');
+  if (isLibraryRelative) {
+    anchors.add(configuredLibraryPath);
+  } else {
+    final parent = _localComicParentPath(comicBaseDir);
+    if (parent != null) anchors.add(parent);
+  }
+
+  final exists = directoryExists ?? (path) => Directory(path).exists();
+  for (final anchor in anchors.toSet()) {
+    try {
+      if (await exists(anchor)) return true;
+    } catch (_) {
+      // An inaccessible evidence path cannot prove deletion.
+    }
+  }
+  return false;
+}
 
 class LocalComic with HistoryMixin implements Comic {
   @override
@@ -63,21 +134,18 @@ class LocalComic with HistoryMixin implements Comic {
   });
 
   LocalComic.fromRow(Row row)
-      : id = row[0] as String,
-        title = row[1] as String,
-        subtitle = row[2] as String,
-        tags = List.from(jsonDecode(row[3] as String)),
-        directory = row[4] as String,
-        chapters = ComicChapters.fromJsonOrNull(jsonDecode(row[5] as String)),
-        cover = row[6] as String,
-        comicType = ComicType(row[7] as int),
-        downloadedChapters = List.from(jsonDecode(row[8] as String)),
-        createdAt = DateTime.fromMillisecondsSinceEpoch(row[9] as int);
+    : id = row[0] as String,
+      title = row[1] as String,
+      subtitle = row[2] as String,
+      tags = List.from(jsonDecode(row[3] as String)),
+      directory = row[4] as String,
+      chapters = ComicChapters.fromJsonOrNull(jsonDecode(row[5] as String)),
+      cover = row[6] as String,
+      comicType = ComicType(row[7] as int),
+      downloadedChapters = List.from(jsonDecode(row[8] as String)),
+      createdAt = DateTime.fromMillisecondsSinceEpoch(row[9] as int);
 
-  File get coverFile => File(FilePath.join(
-        baseDir,
-        cover,
-      ));
+  File get coverFile => File(FilePath.join(baseDir, cover));
 
   String get baseDir => (directory.contains('/') || directory.contains('\\'))
       ? directory
@@ -114,10 +182,10 @@ class LocalComic with HistoryMixin implements Comic {
     if (downloadedChapters.isNotEmpty && chapters != null) {
       final chapters = this.chapters!;
       if (chapters.isGrouped) {
-        for (int i=0; i<chapters.groupCount; i++) {
+        for (int i = 0; i < chapters.groupCount; i++) {
           var group = chapters.getGroupByIndex(i);
           var keys = group.keys.toList();
-          for (int j=0; j<keys.length; j++) {
+          for (int j = 0; j < keys.length; j++) {
             var chapterId = keys[j];
             if (downloadedChapters.contains(chapterId)) {
               firstDownloadedChapter = j + 1;
@@ -145,15 +213,10 @@ class LocalComic with HistoryMixin implements Comic {
         initialChapter: history?.ep ?? firstDownloadedChapter,
         initialPage: history?.page,
         initialChapterGroup: history?.group ?? firstDownloadedChapterGroup,
-        history: history ??
-            History.fromModel(
-              model: this,
-              ep: 0,
-              page: 0,
-            ),
+        history: history ?? History.fromModel(model: this, ep: 0, page: 0),
         author: subtitle,
         tags: tags,
-      )
+      ),
     );
   }
 
@@ -189,6 +252,8 @@ class LocalManager with ChangeNotifier {
 
   Directory get directory => Directory(path);
 
+  bool _isChangingPath = false;
+
   void _checkNoMedia() {
     if (App.isAndroid) {
       var file = File(FilePath.join(path, '.nomedia'));
@@ -200,28 +265,35 @@ class LocalManager with ChangeNotifier {
 
   // return error message if failed
   Future<String?> setNewPath(String newPath) async {
-    var newDir = Directory(newPath);
-    if (!await newDir.exists()) {
-      return "Directory does not exist";
-    }
-    if (!await newDir.list().isEmpty) {
-      return "Directory is not empty";
-    }
+    if (_isChangingPath) return "Storage path migration is already in progress";
+    _isChangingPath = true;
     try {
-      await copyDirectoryIsolate(
-        directory,
-        newDir,
-      );
-      await File(FilePath.join(App.dataPath, 'local_path'))
-          .writeAsString(newPath);
-    } catch (e, s) {
-      Log.error("IO", e, s);
-      return e.toString();
+      if (FilePath.isSameOrWithin(path, newPath)) {
+        return "New directory cannot be inside the current directory";
+      }
+      var newDir = Directory(newPath);
+      if (!await newDir.exists()) {
+        return "Directory does not exist";
+      }
+      if (!await newDir.list().isEmpty) {
+        return "Directory is not empty";
+      }
+      try {
+        await copyDirectoryIsolate(directory, newDir);
+        await File(
+          FilePath.join(App.dataPath, 'local_path'),
+        ).writeAsString(newPath);
+      } catch (e, s) {
+        Log.error("IO", e, s);
+        return e.toString();
+      }
+      await directory.deleteContents(recursive: true);
+      path = newPath;
+      _checkNoMedia();
+      return null;
+    } finally {
+      _isChangingPath = false;
     }
-    await directory.deleteContents(recursive: true);
-    path = newPath;
-    _checkNoMedia();
-    return null;
   }
 
   Future<String> findDefaultPath() async {
@@ -246,22 +318,68 @@ class LocalManager with ChangeNotifier {
     }
   }
 
-  Future<void> _checkPathValidation() async {
-    var testFile = File(FilePath.join(path, 'venera_test'));
+  static const _pathValidationAttempts = 4;
+
+  Future<void> _checkPathValidation({required bool createIfMissing}) async {
+    final targetPath = path;
     try {
-      testFile.createSync();
-      testFile.deleteSync();
-    } catch (e) {
-      Log.error("IO",
-          "Failed to create test file in local path: $e\nUsing default path instead.");
-      path = await findDefaultPath();
+      await retryAsync<void>(
+        (_) => Isolate.run(
+          () => overrideIO(() {
+            final targetDirectory = Directory(targetPath);
+            if (!targetDirectory.existsSync()) {
+              if (!createIfMissing) {
+                throw FileSystemException(
+                  'Configured local comic directory is unavailable',
+                  targetPath,
+                );
+              }
+              targetDirectory.createSync(recursive: true);
+            }
+
+            final testFile = File(
+              FilePath.join(targetPath, '.venera_write_test'),
+            );
+            try {
+              testFile.writeAsBytesSync(const [0x56], flush: true);
+              final persistedBytes = testFile.readAsBytesSync();
+              if (persistedBytes.length != 1 || persistedBytes.single != 0x56) {
+                throw FileSystemException(
+                  'Cannot write to local comic directory',
+                  targetPath,
+                );
+              }
+            } finally {
+              if (testFile.existsSync()) {
+                testFile.deleteSync();
+              }
+            }
+          }),
+        ),
+        maxAttempts: _pathValidationAttempts,
+        delayForAttempt: (failedAttempt) =>
+            Duration(milliseconds: 100 << (failedAttempt - 1)),
+      );
+    } catch (error, stackTrace) {
+      Log.error(
+        "IO",
+        "Local comic path remains configured but is unavailable: "
+            "$targetPath\n$error",
+        stackTrace,
+      );
+      Error.throwWithStackTrace(
+        FileSystemException(
+          'Local comic directory is unavailable after '
+          '$_pathValidationAttempts attempts: $error',
+          targetPath,
+        ),
+        stackTrace,
+      );
     }
   }
 
   Future<void> init() async {
-    _db = sqlite3.open(
-      '${App.dataPath}/local.db',
-    );
+    _db = sqlite3.open('${App.dataPath}/local.db');
     _db.execute('''
       CREATE TABLE IF NOT EXISTS comics (
         id TEXT NOT NULL,
@@ -277,22 +395,20 @@ class LocalManager with ChangeNotifier {
         PRIMARY KEY (id, comic_type)
       );
     ''');
-    if (File(FilePath.join(App.dataPath, 'local_path')).existsSync()) {
-      path = File(FilePath.join(App.dataPath, 'local_path')).readAsStringSync();
-      if (!directory.existsSync()) {
-        path = await findDefaultPath();
+    final configuredPathFile = File(FilePath.join(App.dataPath, 'local_path'));
+    final hasConfiguredPath = await configuredPathFile.exists();
+    if (hasConfiguredPath) {
+      path = await configuredPathFile.readAsString();
+      if (path.isEmpty) {
+        throw FileSystemException(
+          'Configured local comic path is empty',
+          configuredPathFile.path,
+        );
       }
     } else {
       path = await findDefaultPath();
     }
-    try {
-      if (!directory.existsSync()) {
-        await directory.create();
-      }
-    } catch (e, s) {
-      Log.error("IO", "Failed to create local folder: $e", s);
-    }
-    _checkPathValidation();
+    await _checkPathValidation(createIfMissing: !hasConfiguredPath);
     _checkNoMedia();
     await ComicSourceManager().ensureInit();
     restoreDownloadingTasks();
@@ -338,10 +454,10 @@ class LocalManager with ChangeNotifier {
   }
 
   void remove(String id, ComicType comicType) async {
-    _db.execute(
-      'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
-      [id, comicType.value],
-    );
+    _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+      id,
+      comicType.value,
+    ]);
     notifyListeners();
   }
 
@@ -395,10 +511,13 @@ class LocalManager with ChangeNotifier {
   }
 
   LocalComic? findByName(String name) {
-    final res = _db.select('''
+    final res = _db.select(
+      '''
       SELECT * FROM comics
       WHERE title = ? OR directory = ?;
-    ''', [name, name]);
+    ''',
+      [name, name],
+    );
     if (res.isEmpty) {
       return null;
     }
@@ -406,11 +525,14 @@ class LocalManager with ChangeNotifier {
   }
 
   List<LocalComic> search(String keyword) {
-    final res = _db.select('''
+    final res = _db.select(
+      '''
       SELECT * FROM comics
       WHERE title LIKE ? OR tags LIKE ? OR subtitle LIKE ?
       ORDER BY created_at DESC;
-    ''', ['%$keyword%', '%$keyword%', '%$keyword%']);
+    ''',
+      ['%$keyword%', '%$keyword%', '%$keyword%'],
+    );
     return res.map((row) => LocalComic.fromRow(row)).toList();
   }
 
@@ -421,10 +543,25 @@ class LocalManager with ChangeNotifier {
     var comic = find(id, type) ?? (throw "Comic Not Found");
     var directory = Directory(comic.baseDir);
     if (comic.hasChapters) {
-      var cid =
-          ep is int ? comic.chapters!.ids.elementAt(ep - 1) : (ep as String);
+      var cid = ep is int
+          ? comic.chapters!.ids.elementAt(ep - 1)
+          : (ep as String);
       cid = getChapterDirectoryName(cid);
       directory = Directory(FilePath.join(directory.path, cid));
+    }
+    if (!await directory.exists()) {
+      if (await isLocalComicDirectoryDefinitelyMissing(
+        comicDirectory: comic.directory,
+        comicBaseDir: comic.baseDir,
+        configuredLibraryPath: path,
+        hasChapters: comic.hasChapters,
+      )) {
+        throw LocalComicDirectoryMissingException(directory.path);
+      }
+      throw FileSystemException(
+        'Local comic storage is unavailable',
+        directory.path,
+      );
     }
     var files = <File>[];
     await for (var entity in directory.list()) {
@@ -436,6 +573,9 @@ class LocalManager with ChangeNotifier {
         }
         //Hidden file in some file system
         if (entity.name.startsWith('.')) {
+          continue;
+        }
+        if (!isSupportedComicImage(entity)) {
           continue;
         }
         files.add(entity);
@@ -452,44 +592,87 @@ class LocalManager with ChangeNotifier {
     return files.map((e) => "file://${e.path}").toList();
   }
 
-  bool isDownloaded(String id, ComicType type,
-      [int? ep, ComicChapters? chapters]) {
+  bool isDownloaded(
+    String id,
+    ComicType type, [
+    int? ep,
+    ComicChapters? chapters,
+  ]) {
     var comic = find(id, type);
     if (comic == null) return false;
     if (comic.chapters == null || ep == null) return true;
     if (chapters != null) {
       if (comic.chapters?.length != chapters.length) {
         // update
-        add(LocalComic(
-          id: comic.id,
-          title: comic.title,
-          subtitle: comic.subtitle,
-          tags: comic.tags,
-          directory: comic.directory,
-          chapters: chapters,
-          cover: comic.cover,
-          comicType: comic.comicType,
-          downloadedChapters: comic.downloadedChapters,
-          createdAt: comic.createdAt,
-        ));
+        add(
+          LocalComic(
+            id: comic.id,
+            title: comic.title,
+            subtitle: comic.subtitle,
+            tags: comic.tags,
+            directory: comic.directory,
+            chapters: chapters,
+            cover: comic.cover,
+            comicType: comic.comicType,
+            downloadedChapters: comic.downloadedChapters,
+            createdAt: comic.createdAt,
+          ),
+        );
       }
     }
-    return comic.downloadedChapters
-        .contains((chapters ?? comic.chapters)!.ids.elementAtOrNull(ep - 1));
+    return comic.downloadedChapters.contains(
+      (chapters ?? comic.chapters)!.ids.elementAtOrNull(ep - 1),
+    );
+  }
+
+  /// Invalidates stale downloaded metadata without deleting files from disk.
+  ///
+  /// The reader uses this when the database says a network chapter is local,
+  /// but its directory is missing or contains no readable images. Keeping the
+  /// files untouched lets users inspect or recover a partially downloaded
+  /// directory while allowing the reader to fall back to the network source.
+  /// Chapterless downloads are represented by the comic row itself, so their
+  /// stale row must be removed instead of updating an empty chapter list.
+  void invalidateDownloadedContent(String id, ComicType type, int ep) {
+    final comic = find(id, type);
+    if (comic == null) return;
+    if (comic.chapters == null) {
+      if (comic.comicType == ComicType.local) return;
+      _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+        id,
+        type.value,
+      ]);
+      notifyListeners();
+      return;
+    }
+    final chapterId = comic.chapters!.ids.elementAtOrNull(ep - 1);
+    if (chapterId == null) return;
+    final downloaded = comic.downloadedChapters
+        .where((chapter) => chapter != chapterId)
+        .toList();
+    _db.execute(
+      'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+      [jsonEncode(downloaded), id, type.value],
+    );
+    notifyListeners();
   }
 
   List<DownloadTask> downloadingTasks = [];
 
   bool isDownloading(String id, ComicType type) {
-    return downloadingTasks
-        .any((element) => element.id == id && element.comicType == type);
+    return downloadingTasks.any(
+      (element) => element.id == id && element.comicType == type,
+    );
   }
 
   Future<Directory> findValidDirectory(
-      String id, ComicType type, String name) async {
+    String id,
+    ComicType type,
+    String name,
+  ) async {
     var comic = find(id, type);
     if (comic != null) {
-      return Directory(FilePath.join(path, comic.directory));
+      return Directory(comic.baseDir);
     }
     const comicDirectoryMaxLength = 80;
     if (name.length > comicDirectoryMaxLength) {
@@ -529,8 +712,9 @@ class LocalManager with ChangeNotifier {
 
   Future<void> saveCurrentDownloadingTasks() async {
     var tasks = downloadingTasks.map((e) => e.toJson()).toList();
-    await File(FilePath.join(App.dataPath, 'downloading_tasks.json'))
-        .writeAsString(jsonEncode(tasks));
+    await File(
+      FilePath.join(App.dataPath, 'downloading_tasks.json'),
+    ).writeAsString(jsonEncode(tasks));
   }
 
   void restoreDownloadingTasks() {
@@ -560,8 +744,7 @@ class LocalManager with ChangeNotifier {
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
     if (removeFileOnDisk) {
-      var dir = Directory(FilePath.join(path, c.directory));
-      dir.deleteIgnoreError(recursive: true);
+      _scheduleDirectoryDeletion([c.baseDir]);
     }
     // Deleting a local comic means that it's no longer available, thus both favorite and history should be deleted.
     if (c.comicType == ComicType.local) {
@@ -587,56 +770,48 @@ class LocalManager with ChangeNotifier {
     if (newDownloadedChapters.isNotEmpty) {
       _db.execute(
         'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
-        [
-          jsonEncode(newDownloadedChapters),
-          c.id,
-          c.comicType.value,
-        ],
+        [jsonEncode(newDownloadedChapters), c.id, c.comicType.value],
       );
     } else {
-      _db.execute(
-        'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
-        [c.id, c.comicType.value],
+      _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+        c.id,
+        c.comicType.value,
+      ]);
+    }
+    var shouldRemovedDirs = <String>[];
+    for (var chapter in chapters) {
+      shouldRemovedDirs.add(
+        FilePath.join(c.baseDir, getChapterDirectoryName(chapter)),
       );
     }
-    var shouldRemovedDirs = <Directory>[];
-    for (var chapter in chapters) {
-      var dir = Directory(FilePath.join(
-        c.baseDir,
-        getChapterDirectoryName(chapter),
-      ));
-      if (dir.existsSync()) {
-        shouldRemovedDirs.add(dir);
-      }
-    }
     if (shouldRemovedDirs.isNotEmpty) {
-      _deleteDirectories(shouldRemovedDirs);
+      _scheduleDirectoryDeletion(shouldRemovedDirs);
     }
     notifyListeners();
   }
 
-  void batchDeleteComics(List<LocalComic> comics, [bool removeFileOnDisk = true, bool removeFavoriteAndHistory = true]) {
+  void batchDeleteComics(
+    List<LocalComic> comics, [
+    bool removeFileOnDisk = true,
+    bool removeFavoriteAndHistory = true,
+  ]) {
     if (comics.isEmpty) {
       return;
     }
 
-    var shouldRemovedDirs = <Directory>[];
+    var shouldRemovedDirs = <String>[];
     _db.execute('BEGIN TRANSACTION;');
     try {
       for (var c in comics) {
         if (removeFileOnDisk) {
-          var dir = Directory(FilePath.join(path, c.directory));
-          if (dir.existsSync()) {
-            shouldRemovedDirs.add(dir);
-          }
+          shouldRemovedDirs.add(c.baseDir);
         }
-        _db.execute(
-          'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
-          [c.id, c.comicType.value],
-        );
+        _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+          c.id,
+          c.comicType.value,
+        ]);
       }
-    }
-    catch(e, s) {
+    } catch (e, s) {
       Log.error("LocalManager", "Failed to batch delete comics: $e", s);
       _db.execute('ROLLBACK;');
       return;
@@ -653,22 +828,56 @@ class LocalManager with ChangeNotifier {
     notifyListeners();
 
     if (removeFileOnDisk) {
-      _deleteDirectories(shouldRemovedDirs);
+      _scheduleDirectoryDeletion(shouldRemovedDirs);
     }
   }
 
-  /// Deletes the directories in a separate isolate to avoid blocking the UI thread.
-  static void _deleteDirectories(List<Directory> directories) {
-    Isolate.run(() async {
-      await SAFTaskWorker().init();
-      for (var dir in directories) {
-        try {
-          if (dir.existsSync()) {
-            await dir.delete(recursive: true);
-          }
-        } catch (e) {
-          continue;
+  static void _scheduleDirectoryDeletion(List<String> directoryPaths) {
+    deleteDirectories(directoryPaths).then(
+      (errors) {
+        for (final error in errors) {
+          Log.error("LocalManager", error);
         }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        Log.error(
+          "LocalManager",
+          "Failed to delete local files: $error",
+          stackTrace,
+        );
+      },
+    );
+  }
+
+  /// Deletes directories in a separate isolate to avoid blocking the UI.
+  ///
+  /// Only paths are sent to the isolate. In particular, an [AndroidDirectory]
+  /// descriptor belongs to the isolate in which it was opened and must not be
+  /// copied to another isolate. The directory is reopened under [overrideIO]
+  /// after the isolate's SAF worker has started.
+  static Future<List<String>> deleteDirectories(List<String> directoryPaths) {
+    final paths = directoryPaths.toSet().toList(growable: false);
+    if (paths.isEmpty) return Future.value(const <String>[]);
+    return Isolate.run(() async {
+      final worker = SAFTaskWorker();
+      await worker.init();
+      try {
+        return await overrideIO(() async {
+          final errors = <String>[];
+          for (final path in paths) {
+            try {
+              final dir = Directory(path);
+              if (await dir.exists()) {
+                await dir.delete(recursive: true);
+              }
+            } catch (error) {
+              errors.add("Failed to delete $path: $error");
+            }
+          }
+          return errors;
+        });
+      } finally {
+        worker.dispose();
       }
     });
   }
@@ -677,9 +886,15 @@ class LocalManager with ChangeNotifier {
     var builder = StringBuffer();
     for (var i = 0; i < name.length; i++) {
       var char = name[i];
-      if (char == '/' || char == '\\' || char == ':' || char == '*' ||
-          char == '?'
-          || char == '"' || char == '<' || char == '>' || char == '|') {
+      if (char == '/' ||
+          char == '\\' ||
+          char == ':' ||
+          char == '*' ||
+          char == '?' ||
+          char == '"' ||
+          char == '<' ||
+          char == '>' ||
+          char == '|') {
         builder.write('_');
       } else {
         builder.write(char);

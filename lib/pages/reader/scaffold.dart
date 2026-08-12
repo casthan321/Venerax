@@ -135,10 +135,10 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
             child: widget.child,
           ),
         ),
-        if (appdata.settings['showPageNumberInReader'] == true && !isOnChapterCommentsPage)
+        if (appdata.settings['showPageNumberInReader'] == true &&
+            !isOnChapterCommentsPage)
           buildPageInfoText(),
-        if (!isOnChapterCommentsPage)
-          buildStatusInfo(),
+        if (!isOnChapterCommentsPage) buildStatusInfo(),
         AnimatedPositioned(
           duration: const Duration(milliseconds: 180),
           right: 16,
@@ -167,10 +167,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   Widget buildTop() {
-    final epName =
-      context.reader.widget.chapters?.titles.elementAtOrNull(
-        context.reader.chapter - 1,
-      );
+    final epName = context.reader.widget.chapters?.titles.elementAtOrNull(
+      context.reader.chapter - 1,
+    );
 
     return BlurEffect(
       child: Container(
@@ -178,10 +177,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
         decoration: BoxDecoration(
           color: context.colorScheme.surface.toOpacity(0.92),
           border: Border(
-            bottom: BorderSide(
-              color: Colors.grey.toOpacity(0.5),
-              width: 0.5,
-            ),
+            bottom: BorderSide(color: Colors.grey.toOpacity(0.5), width: 0.5),
           ),
         ),
         child: Padding(
@@ -195,29 +191,31 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
               const BackButton(),
               const SizedBox(width: 8),
               Expanded(
-                child: epName == null ? Text(
-                  context.reader.widget.name,
-                  style: ts.s18,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ) : Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      context.reader.widget.name,
-                      style: ts.s16,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    Text(
-                      epName,
-                      style: ts.s12,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
+                child: epName == null
+                    ? Text(
+                        context.reader.widget.name,
+                        style: ts.s18,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      )
+                    : Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            context.reader.widget.name,
+                            style: ts.s16,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          Text(
+                            epName,
+                            style: ts.s12,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
               ),
               const SizedBox(width: 8),
               if (shouldShowChapterComments())
@@ -255,7 +253,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
 
   void addImageFavorite() async {
     try {
-      if (context.reader.images![0].contains('file://')) {
+      if (!supportsImageFavorites(
+        isImportedLocalComic: context.reader.type == ComicType.local,
+      )) {
         showToast(
           message: "Local comic collection is not supported at present".tl,
           context: context,
@@ -540,10 +540,11 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
                   for (var button in buttons)
                     if (!small)
                       button.paddingHorizontal(4)
-                    else
-                      ...[button, const Spacer()],
-                  if (!small)
-                    const SizedBox(width: 4),
+                    else ...[
+                      button,
+                      const Spacer(),
+                    ],
+                  if (!small) const SizedBox(width: 4),
                 ],
               );
             },
@@ -586,13 +587,14 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       focusNode: sliderFocus,
       value: displayPage.toDouble(),
       min: 1,
-      max: context.reader.maxPage
-          .clamp(displayPage, 1 << 16)
-          .toDouble(),
+      max: context.reader.maxPage.clamp(displayPage, 1 << 16).toDouble(),
       reversed: isReversed,
       divisions: (context.reader.maxPage - 1).clamp(2, 1 << 16),
       onChanged: (i) {
-        context.reader.toPage(i.toInt());
+        // Progress seeking can emit a new target before a long-distance
+        // continuous-mode animation has mounted. Jumping directly avoids
+        // leaving the reader locked behind an unfinished animation future.
+        context.reader.toPage(i.toInt(), animate: false);
       },
     );
   }
@@ -714,7 +716,8 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
           if (key == "quickCollectImage") {
             addDragListener();
           }
-          if (key == "showChapterComments" || key == "showChapterCommentsAtEnd") {
+          if (key == "showChapterComments" ||
+              key == "showChapterCommentsAtEnd") {
             update();
           }
           context.reader.update();
@@ -823,10 +826,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
               borderRadius: BorderRadius.circular(16),
               child: Center(
                 child: Icon(
-                  _getArrowIcon(
-                    isReversed,
-                    showFloatingButtonValue,
-                  ),
+                  _getArrowIcon(isReversed, showFloatingButtonValue),
                   size: 24,
                   color: Theme.of(context).colorScheme.onPrimaryContainer,
                 ),
@@ -840,9 +840,13 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
 
   IconData _getArrowIcon(bool reversed, int value) {
     if (reversed) {
-      return value == 1 ? Icons.arrow_back_ios_outlined : Icons.arrow_forward_ios;
+      return value == 1
+          ? Icons.arrow_back_ios_outlined
+          : Icons.arrow_forward_ios;
     } else {
-      return value == 1 ? Icons.arrow_forward_ios : Icons.arrow_back_ios_outlined;
+      return value == 1
+          ? Icons.arrow_forward_ios
+          : Icons.arrow_back_ios_outlined;
     }
   }
 

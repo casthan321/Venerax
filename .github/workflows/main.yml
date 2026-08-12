@@ -1,9 +1,7 @@
-name: Build ALL
-run-name: Build ALL
+name: Build all platforms (manual)
+run-name: Build all platforms (manual)
 on:
   workflow_dispatch: {}
-  release:
-    types: [published]
 
 jobs:
   Build_MacOS:
@@ -80,35 +78,6 @@ jobs:
         with:
           name: ios_build
           path: result/
-  Build_Android:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v3
-      - run: rm -rf /opt/hostedtoolcache
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: "stable"
-          flutter-version-file: pubspec.yaml
-          architecture: x64
-      - name: Decode and install certificate
-        env:
-          STORE_FILE: ${{ secrets.ANDROID_KEYSTORE }}
-          PROPERTY_FILE: ${{ secrets.ANDROID_KEY_PROPERTIES }}
-        run: |
-            echo "$STORE_FILE" | base64 --decode > android/keystore.jks
-            echo "$PROPERTY_FILE" > android/key.properties
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'oracle'
-          java-version: '17'
-      - name: Check rust-toolchain.toml
-        run: rustup show
-      - run: flutter pub get
-      - run: flutter build apk --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: apks
-          path: build/app/outputs/apk/release
   Build_Windows:
     runs-on: windows-latest
     steps:
@@ -181,51 +150,3 @@ jobs:
         with:
           name: deb_arm64_build
           path: build/linux/x64/release/debian # This is a bug related to flutter_to_debian, but it's not a big deal.
-
-  Release:
-    runs-on: ubuntu-22.04
-    needs: [Build_MacOS, Build_IOS, Build_Android, Build_Windows, Build_Linux, Build_Linux_ARM64]
-    if: github.event_name == 'release'  # 仅在 push 事件时执行
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos_build
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: ios_build
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: apks
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows_build
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: deb_build
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: arch_build
-          path: outputs
-      - uses: actions/download-artifact@v4
-        with:
-          name: deb_arm64_build
-          path: outputs
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            outputs/*.ipa
-            outputs/*.dmg
-            outputs/*.apk
-            outputs/*.zip
-            outputs/*.exe
-            outputs/*.deb
-            outputs/*.zst
-            outputs/*.AppImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.ACTION_GITHUB_TOKEN }}

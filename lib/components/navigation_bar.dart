@@ -212,10 +212,7 @@ class NaviPaneState extends State<NaviPane>
             ],
           );
           if (sideInsets != EdgeInsets.zero) {
-            content = Padding(
-              padding: sideInsets,
-              child: content,
-            );
+            content = Padding(padding: sideInsets, child: content);
           }
           return content;
         },
@@ -263,7 +260,7 @@ class NaviPaneState extends State<NaviPane>
     return widget.pageBuilder(currentPage);
   }
 
-  Widget buildTop() {
+  Widget buildTop({bool showActions = true}) {
     return Material(
       child: Container(
         padding: const EdgeInsets.only(left: 16, right: 16),
@@ -276,14 +273,15 @@ class NaviPaneState extends State<NaviPane>
               style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const Spacer(),
-            for (var action in widget.paneActions)
-              Tooltip(
-                message: action.label,
-                child: IconButton(
-                  icon: Icon(action.icon),
-                  onPressed: action.onTap,
+            if (showActions)
+              for (var action in widget.paneActions)
+                Tooltip(
+                  message: action.label,
+                  child: IconButton(
+                    icon: Icon(action.icon),
+                    onPressed: action.onTap,
+                  ),
                 ),
-              ),
           ],
         ),
       ),
@@ -670,21 +668,27 @@ class _NaviMainViewState extends State<_NaviMainView> {
 
   @override
   Widget build(BuildContext context) {
-    var shouldShowAppBar = state.controller.value < 2;
+    final navigationValue = state.controller.value;
+    final shouldShowTopBar = navigationValue < 3;
+    final shouldShowBottomBar = navigationValue < 2;
+    final shouldShowTopActions = navigationValue < 2;
     return Column(
       children: [
-        if (shouldShowAppBar) state.buildTop().paddingTop(context.padding.top),
+        if (shouldShowTopBar)
+          state
+              .buildTop(showActions: shouldShowTopActions)
+              .paddingTop(context.padding.top),
         Expanded(
           child: MediaQuery.removePadding(
             context: context,
-            removeTop: shouldShowAppBar,
+            removeTop: shouldShowTopBar,
             child: AnimatedSwitcher(
               duration: _fastAnimationDuration,
               child: state.buildMainViewContent(),
             ),
           ),
         ),
-        if (shouldShowAppBar)
+        if (shouldShowBottomBar)
           state.buildBottom().paddingBottom(context.padding.bottom),
       ],
     );

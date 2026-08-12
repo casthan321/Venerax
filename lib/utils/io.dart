@@ -27,11 +27,76 @@ class IO {
 class FilePath {
   const FilePath._();
 
-  static String join(String path1, String path2,
-      [String? path3, String? path4, String? path5]) {
+  static String join(
+    String path1,
+    String path2, [
+    String? path3,
+    String? path4,
+    String? path5,
+  ]) {
     return p.join(path1, path2, path3, path4, path5);
   }
+
+  /// Whether [candidate] is [parent] itself or is located below it.
+  ///
+  /// Android's Storage Access Framework represents external-storage paths as
+  /// `android://<volume>:<path>`. Convert those document IDs to their normal
+  /// storage form before comparing them so a migration cannot copy a comic
+  /// directory into one of its own descendants.
+  static bool isSameOrWithin(String parent, String candidate) {
+    final usesAndroidDocumentPath =
+        parent.startsWith('android://') || candidate.startsWith('android://');
+    if (!usesAndroidDocumentPath) {
+      return p.equals(parent, candidate) || p.isWithin(parent, candidate);
+    }
+
+    final normalizedParent = _androidDocumentPathToStoragePath(parent);
+    final normalizedCandidate = _androidDocumentPathToStoragePath(candidate);
+    return p.posix.equals(normalizedParent, normalizedCandidate) ||
+        p.posix.isWithin(normalizedParent, normalizedCandidate);
+  }
+
+  static String _androidDocumentPathToStoragePath(String path) {
+    var normalized = path.replaceAll('\\', '/');
+    if (!normalized.startsWith('android://')) {
+      return p.posix.normalize(normalized);
+    }
+
+    final documentId = normalized.substring('android://'.length);
+    final volumeSeparator = documentId.indexOf(':');
+    if (volumeSeparator < 0) {
+      return p.posix.normalize(normalized);
+    }
+
+    final volume = documentId.substring(0, volumeSeparator);
+    final relativePath = documentId.substring(volumeSeparator + 1);
+    final storageRoot = volume.toLowerCase() == 'primary'
+        ? '/storage/emulated/0'
+        : '/storage/$volume';
+    return p.posix.normalize(p.posix.join(storageRoot, relativePath));
+  }
 }
+
+const supportedComicImageExtensions = <String>{
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'jpe',
+};
+
+/// Returns whether [path] has an image extension supported by the reader.
+///
+/// This is deliberately shared by importing and reading. Otherwise an import
+/// can accept a directory that the reader later interprets differently.
+bool isSupportedComicImagePath(String path) {
+  final extension = p.extension(path).toLowerCase();
+  if (extension.isEmpty) return false;
+  return supportedComicImageExtensions.contains(extension.substring(1));
+}
+
+bool isSupportedComicImage(File file) => isSupportedComicImagePath(file.path);
 
 extension FileSystemEntityExt on FileSystemEntity {
   /// Get the base name of the file or directory.
@@ -171,7 +236,7 @@ Future<void> copyDirectory(Directory source, Directory destination) async {
     } else if (content is Directory) {
       Directory newDirectory = Directory(newPath);
       newDirectory.createSync();
-      copyDirectory(content.absolute, newDirectory.absolute);
+      await copyDirectory(content.absolute, newDirectory.absolute);
     }
   }
 }
@@ -179,8 +244,25 @@ Future<void> copyDirectory(Directory source, Directory destination) async {
 /// Copy the **contents** of the source directory to the destination directory.
 /// This function is executed in an isolate to prevent the UI from freezing.
 Future<void> copyDirectoryIsolate(
-    Directory source, Directory destination) async {
-  await Isolate.run(() => overrideIO(() => copyDirectory(source, destination)));
+  Directory source,
+  Directory destination,
+) async {
+  // SAF-backed FileSystemEntity instances carry document descriptors and
+  // finalizers that belong to the isolate where they were opened. Only send
+  // plain paths, then reopen both sides inside the worker isolate.
+  final sourcePath = source.path;
+  final destinationPath = destination.path;
+  await Isolate.run(() async {
+    final worker = SAFTaskWorker();
+    await worker.init();
+    try {
+      await overrideIO(
+        () => copyDirectory(Directory(sourcePath), Directory(destinationPath)),
+      );
+    } finally {
+      worker.dispose();
+    }
+  });
 }
 
 String findValidDirectoryName(String path, String directory) {
@@ -232,8 +314,9 @@ class DirectoryPicker {
         }
       } else {
         // ios, macos
-        directory =
-            await _methodChannel.invokeMethod<String?>("getDirectoryPath");
+        directory = await _methodChannel.invokeMethod<String?>(
+          "getDirectoryPath",
+        );
       }
       if (directory == null) return null;
       _finalizer.attach(this, directory);
@@ -328,8 +411,11 @@ Future<String?> selectDirectoryIOS() async {
   return IOSDirectoryPicker.selectDirectory();
 }
 
-Future<void> saveFile(
-    {Uint8List? data, required String filename, File? file}) async {
+Future<void> saveFile({
+  Uint8List? data,
+  required String filename,
+  File? file,
+}) async {
   if (data == null && file == null) {
     throw Exception("data and file cannot be null at the same time");
   }
@@ -394,10 +480,7 @@ final class _IOOverrides extends IOOverrides {
 }
 
 T overrideIO<T>(T Function() f) {
-  return IOOverrides.runWithIOOverrides<T>(
-    f,
-    _IOOverrides(),
-  );
+  return IOOverrides.runWithIOOverrides<T>(f, _IOOverrides());
 }
 
 class Share {
@@ -407,20 +490,22 @@ class Share {
     required String mime,
   }) {
     if (!App.isWindows) {
-      s.Share.shareXFiles(
-        [s.XFile.fromData(data, mimeType: mime)],
-        fileNameOverrides: [filename],
+      s.SharePlus.instance.share(
+        s.ShareParams(
+          files: [s.XFile.fromData(data, mimeType: mime)],
+          fileNameOverrides: [filename],
+        ),
       );
     } else {
       // write to cache
       var file = File(FilePath.join(App.cachePath, filename));
       file.writeAsBytesSync(data);
-      s.Share.shareXFiles([s.XFile(file.path)]);
+      s.SharePlus.instance.share(s.ShareParams(files: [s.XFile(file.path)]));
     }
   }
 
   static void shareText(String text) {
-    s.Share.share(text);
+    s.SharePlus.instance.share(s.ShareParams(text: text));
   }
 }
 

@@ -2,11 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 import 'dart:math';
-import 'dart:ffi' as ffi;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
@@ -23,6 +21,66 @@ import 'consts.dart';
 part "image_favorites.dart";
 
 typedef HistoryType = ComicType;
+
+const _insertHistorySql = """
+  insert or replace into history (id, title, subtitle, cover, time, type, ep, page, readEpisode, max_page, chapter_group)
+  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+""";
+
+/// Writes a history row on an isolate-owned database connection.
+///
+/// A sqlite connection must not be shared across isolates. The database path
+/// and row values are copied to the worker instead, and the connection opened
+/// there is always disposed before the worker completes.
+@visibleForTesting
+Future<void> writeHistoryToDatabaseInIsolate(
+  String databasePath,
+  List<Object?> values, {
+  Database Function(String path)? openDatabase,
+}) {
+  return Isolate.run(() {
+    final db = (openDatabase ?? sqlite3.open)(databasePath);
+    try {
+      // The UI isolate may briefly hold a read/write transaction. Waiting is
+      // preferable to dropping the reader's progress with SQLITE_BUSY.
+      db.execute('PRAGMA busy_timeout = 5000;');
+      db.execute(_insertHistorySql, values);
+    } finally {
+      db.dispose();
+    }
+  });
+}
+
+/// Serializes history writes and contains task/reporting failures.
+///
+/// Reader progress updates are intentionally fire-and-forget at call sites.
+/// Therefore every returned future must complete without an unhandled error,
+/// while [drain] must still include work queued behind the active operation.
+@visibleForTesting
+class HistoryAsyncWriteQueue {
+  Future<void> _tail = Future<void>.value();
+
+  Future<void> add(
+    Future<void> Function() task, {
+    required void Function(Object error, StackTrace stackTrace) onError,
+  }) {
+    final completion = _tail.then((_) async {
+      try {
+        await task();
+      } catch (error, stackTrace) {
+        try {
+          onError(error, stackTrace);
+        } catch (_) {
+          // Logging is best effort and must not create an unhandled Future.
+        }
+      }
+    });
+    _tail = completion;
+    return completion;
+  }
+
+  Future<void> drain() => _tail;
+}
 
 abstract mixin class HistoryMixin {
   String get title;
@@ -74,34 +132,34 @@ class History implements Comic {
   @override
   int? maxPage;
 
-  History.fromModel(
-      {required HistoryMixin model,
-      required this.ep,
-      required this.page,
-      this.group,
-      Set<String>? readChapters,
-      DateTime? time})
-      : type = model.historyType,
-        title = model.title,
-        subtitle = model.subTitle ?? '',
-        cover = model.cover,
-        id = model.id,
-        readEpisode = readChapters ?? <String>{},
-        time = time ?? DateTime.now();
+  History.fromModel({
+    required HistoryMixin model,
+    required this.ep,
+    required this.page,
+    this.group,
+    Set<String>? readChapters,
+    DateTime? time,
+  }) : type = model.historyType,
+       title = model.title,
+       subtitle = model.subTitle ?? '',
+       cover = model.cover,
+       id = model.id,
+       readEpisode = readChapters ?? <String>{},
+       time = time ?? DateTime.now();
 
   History.fromMap(Map<String, dynamic> map)
-      : type = HistoryType(map["type"]),
-        time = DateTime.fromMillisecondsSinceEpoch(map["time"]),
-        title = map["title"],
-        subtitle = map["subtitle"],
-        cover = map["cover"],
-        ep = map["ep"],
-        page = map["page"],
-        id = map["id"],
-        readEpisode = Set<String>.from(
-            (map["readEpisode"] as List<dynamic>?)?.toSet() ??
-                const <String>{}),
-        maxPage = map["max_page"];
+    : type = HistoryType(map["type"]),
+      time = DateTime.fromMillisecondsSinceEpoch(map["time"]),
+      title = map["title"],
+      subtitle = map["subtitle"],
+      cover = map["cover"],
+      ep = map["ep"],
+      page = map["page"],
+      id = map["id"],
+      readEpisode = Set<String>.from(
+        (map["readEpisode"] as List<dynamic>?)?.toSet() ?? const <String>{},
+      ),
+      maxPage = map["max_page"];
 
   @override
   String toString() {
@@ -109,19 +167,21 @@ class History implements Comic {
   }
 
   History.fromRow(Row row)
-      : type = HistoryType(row["type"]),
-        time = DateTime.fromMillisecondsSinceEpoch(row["time"]),
-        title = row["title"],
-        subtitle = row["subtitle"],
-        cover = row["cover"],
-        ep = row["ep"],
-        page = row["page"],
-        id = row["id"],
-        readEpisode = Set<String>.from((row["readEpisode"] as String)
+    : type = HistoryType(row["type"]),
+      time = DateTime.fromMillisecondsSinceEpoch(row["time"]),
+      title = row["title"],
+      subtitle = row["subtitle"],
+      cover = row["cover"],
+      ep = row["ep"],
+      page = row["page"],
+      id = row["id"],
+      readEpisode = Set<String>.from(
+        (row["readEpisode"] as String)
             .split(',')
-            .where((element) => element != "")),
-        maxPage = row["max_page"],
-        group = row["chapter_group"];
+            .where((element) => element != ""),
+      ),
+      maxPage = row["max_page"],
+      group = row["chapter_group"];
 
   @override
   bool operator ==(Object other) {
@@ -134,23 +194,17 @@ class History implements Comic {
   @override
   String get description {
     var res = "";
-    if (group != null){
-      res += "${"Group @group".tlParams({
-        "group": group!,
-      })} - ";
+    if (group != null) {
+      res += "${"Group @group".tlParams({"group": group!})} - ";
     }
     if (ep >= 1) {
-      res += "Chapter @ep".tlParams({
-        "ep": ep,
-      });
+      res += "Chapter @ep".tlParams({"ep": ep});
     }
     if (page >= 1) {
       if (ep >= 1) {
         res += " - ";
       }
-      res += "Page @page".tlParams({
-        "page": page,
-      });
+      res += "Page @page".tlParams({"page": page});
     }
     return res;
   }
@@ -188,6 +242,8 @@ class HistoryManager with ChangeNotifier {
 
   late Database _db;
 
+  late String _databasePath;
+
   int get length => _db.select("select count(*) from history;").first[0] as int;
 
   /// Cache of history ids. Improve the performance of find operation.
@@ -202,7 +258,8 @@ class HistoryManager with ChangeNotifier {
     if (isInitialized) {
       return;
     }
-    _db = sqlite3.open("${App.dataPath}/history.db");
+    _databasePath = "${App.dataPath}/history.db";
+    _db = sqlite3.open(_databasePath);
 
     _db.execute("""
         create table if not exists history  (
@@ -230,52 +287,48 @@ class HistoryManager with ChangeNotifier {
     isInitialized = true;
   }
 
-  static const _insertHistorySql = """
-        insert or replace into history (id, title, subtitle, cover, time, type, ep, page, readEpisode, max_page, chapter_group)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-      """;
-
-  static Future<void> _addHistoryAsync(int dbAddr, History newItem) {
-    return Isolate.run(() {
-      var db = sqlite3.fromPointer(ffi.Pointer.fromAddress(dbAddr));
-      db.execute(_insertHistorySql, [
-        newItem.id,
-        newItem.title,
-        newItem.subtitle,
-        newItem.cover,
-        newItem.time.millisecondsSinceEpoch,
-        newItem.type.value,
-        newItem.ep,
-        newItem.page,
-        newItem.readEpisode.join(','),
-        newItem.maxPage,
-        newItem.group
-      ]);
-    });
-  }
-
-  bool _haveAsyncTask = false;
+  final _asyncWrites = HistoryAsyncWriteQueue();
 
   /// Create a isolate to add history to prevent blocking the UI thread.
-  Future<void> addHistoryAsync(History newItem) async {
-    while (_haveAsyncTask) {
-      await Future.delayed(Duration(milliseconds: 20));
-    }
-
-    _haveAsyncTask = true;
-    await _addHistoryAsync(_db.handle.address, newItem);
-    _haveAsyncTask = false;
-    if (_cachedHistoryIds == null) {
-      updateCache();
-    } else {
-      _cachedHistoryIds![newItem.id] = true;
-    }
-    cachedHistories[newItem.id] = newItem;
-    if (cachedHistories.length > 10) {
-      cachedHistories.remove(cachedHistories.keys.first);
-    }
-    notifyListeners();
+  Future<void> addHistoryAsync(History newItem) {
+    return _asyncWrites.add(
+      () async {
+        await writeHistoryToDatabaseInIsolate(_databasePath, [
+          newItem.id,
+          newItem.title,
+          newItem.subtitle,
+          newItem.cover,
+          newItem.time.millisecondsSinceEpoch,
+          newItem.type.value,
+          newItem.ep,
+          newItem.page,
+          newItem.readEpisode.join(','),
+          newItem.maxPage,
+          newItem.group,
+        ]);
+        if (_cachedHistoryIds == null) {
+          updateCache();
+        } else {
+          _cachedHistoryIds![newItem.id] = true;
+        }
+        cachedHistories[newItem.id] = newItem;
+        if (cachedHistories.length > 10) {
+          cachedHistories.remove(cachedHistories.keys.first);
+        }
+        notifyListeners();
+      },
+      onError: (error, stackTrace) {
+        Log.error(
+          'History',
+          'Failed to save reading progress: $error',
+          stackTrace,
+        );
+      },
+    );
   }
+
+  /// Waits for the active write and every write already queued behind it.
+  Future<void> waitForAsyncTasks() => _asyncWrites.drain();
 
   /// add history. if exists, update time.
   ///
@@ -292,7 +345,7 @@ class HistoryManager with ChangeNotifier {
       newItem.page,
       newItem.readEpisode.join(','),
       newItem.maxPage,
-      newItem.group
+      newItem.group,
     ]);
     if (_cachedHistoryIds == null) {
       updateCache();
@@ -312,36 +365,42 @@ class HistoryManager with ChangeNotifier {
     notifyListeners();
   }
 
-void clearUnfavoritedHistory() {
-  _db.execute('BEGIN TRANSACTION;');
-  try {
-    final idAndTypes = _db.select("""
+  void clearUnfavoritedHistory() {
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      final idAndTypes = _db.select("""
       select id, type from history;
     """);
-    for (var element in idAndTypes) {
-      final id = element["id"] as String;
-      final type = ComicType(element["type"] as int);
-      if (!LocalFavoritesManager().isExist(id, type)) {
-        _db.execute("""
+      for (var element in idAndTypes) {
+        final id = element["id"] as String;
+        final type = ComicType(element["type"] as int);
+        if (!LocalFavoritesManager().isExist(id, type)) {
+          _db.execute(
+            """
           delete from history
           where id == ? and type == ?;
-        """, [id, type.value]);
+        """,
+            [id, type.value],
+          );
+        }
       }
+      _db.execute('COMMIT;');
+    } catch (e) {
+      _db.execute('ROLLBACK;');
+      rethrow;
     }
-    _db.execute('COMMIT;');
-  } catch (e) {
-    _db.execute('ROLLBACK;');
-    rethrow;
+    updateCache();
+    notifyListeners();
   }
-  updateCache();
-  notifyListeners();
-}
 
   void remove(String id, ComicType type) async {
-    _db.execute("""
+    _db.execute(
+      """
       delete from history
       where id == ? and type == ?;
-    """, [id, type.value]);
+    """,
+      [id, type.value],
+    );
     updateCache();
     notifyListeners();
   }
@@ -372,10 +431,13 @@ void clearUnfavoritedHistory() {
       return cachedHistories[id];
     }
 
-    var res = _db.select("""
+    var res = _db.select(
+      """
       select * from history
       where id == ? and type == ?;
-    """, [id, type.value]);
+    """,
+      [id, type.value],
+    );
     if (res.isEmpty) {
       return null;
     }
@@ -418,10 +480,13 @@ void clearUnfavoritedHistory() {
     _db.execute('BEGIN TRANSACTION;');
     try {
       for (var history in histories) {
-        _db.execute("""
+        _db.execute(
+          """
           delete from history
           where id == ? and type == ?;
-        """, [history.id, history.type.value]);
+        """,
+          [history.id, history.type.value],
+        );
       }
       _db.execute('COMMIT;');
     } catch (e) {
@@ -520,7 +585,9 @@ void clearUnfavoritedHistory() {
       if (history.sourceKey == 'local') {
         skipped++;
         current++;
-        controller.add(RefreshProgress(total, current, success, failed, skipped));
+        controller.add(
+          RefreshProgress(total, current, success, failed, skipped),
+        );
         continue;
       }
       historiesToRefresh.add(history);

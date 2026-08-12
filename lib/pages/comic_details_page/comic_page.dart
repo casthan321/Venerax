@@ -16,6 +16,7 @@ import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/image_provider/cached_image.dart';
+import 'package:venera/foundation/image_provider/history_cover_fallback.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/download.dart';
@@ -260,6 +261,11 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   Future<void> onDataLoaded() async {
     isLiked = comic.isLiked ?? false;
     isFavorite = comic.isFavorite ?? false;
+    if (history != null &&
+        shouldUpdateHistoryCover(history!.cover, comic.cover)) {
+      history!.cover = comic.cover;
+      HistoryManager().addHistory(history!);
+    }
     // For sources with multi-folder favorites, prefer querying folders to get accurate favorite status
     // Some sources may not set isFavorite reliably when multi-folder is enabled
     if (comicSource.favoriteData?.loadFolders != null && comicSource.isLogged) {
@@ -321,7 +327,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
                 clipBehavior: Clip.antiAlias,
                 child: AnimatedImage(
                   image: CachedImageProvider(
-                    widget.cover ?? comic.cover,
+                    comic.cover,
                     sourceKey: comic.sourceKey,
                     cid: comic.id,
                   ),
@@ -733,7 +739,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   void _viewCover(BuildContext context) {
     final imageProvider = CachedImageProvider(
-      widget.cover ?? comic.cover,
+      comic.cover,
       sourceKey: comic.sourceKey,
       cid: comic.id,
     );
@@ -750,7 +756,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   void _saveCover(BuildContext context) async {
     try {
       final imageProvider = CachedImageProvider(
-        widget.cover ?? comic.cover,
+        comic.cover,
         sourceKey: comic.sourceKey,
         cid: comic.id,
       );

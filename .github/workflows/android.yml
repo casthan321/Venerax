@@ -1,0 +1,219 @@
+name: Android
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.41.4
+  JAVA_VERSION: 17
+  FORK_BASE_COMMIT: a0eba914f4c2a84ac1bc925adec2baabe920b9be
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@1.85.1
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+      - run: flutter pub get --enforce-lockfile
+      - name: Check formatting of community-fork Dart changes
+        shell: bash
+        run: |
+          mapfile -t dart_files < <(
+            git diff --name-only --diff-filter=ACMRT "$FORK_BASE_COMMIT" HEAD -- '*.dart'
+          )
+          if (( ${#dart_files[@]} )); then
+            dart format --output=none --set-exit-if-changed "${dart_files[@]}"
+          fi
+      - run: flutter analyze --no-pub
+      - run: flutter test --no-pub
+
+  build-release:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@1.85.1
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+      - name: Configure release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          test -n "$ANDROID_SIGNING_CERT_SHA256"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/venera-community-release.jks
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          def java_property(value: str) -> str:
+              return (value.replace('\\', '\\\\')
+                           .replace('\n', '\\n')
+                           .replace('\r', '\\r')
+                           .replace('\t', '\\t')
+                           .replace('\f', '\\f')
+                           .replace('=', '\\=')
+                           .replace(':', '\\:')
+                           .replace('#', '\\#')
+                           .replace('!', '\\!')
+                           .replace(' ', '\\ '))
+
+          values = {
+              'storeFile': '../venera-community-release.jks',
+              'storePassword': os.environ['ANDROID_KEYSTORE_PASSWORD'],
+              'keyAlias': os.environ['ANDROID_KEY_ALIAS'],
+              'keyPassword': os.environ['ANDROID_KEY_PASSWORD'],
+          }
+          Path('android/key.properties').write_text(
+              ''.join(f'{key}={java_property(value)}\n' for key, value in values.items()),
+              encoding='utf-8',
+          )
+          PY
+          keytool -list \
+            -keystore android/venera-community-release.jks \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+          expected_cert="$({
+            printf '%s' "$ANDROID_SIGNING_CERT_SHA256" |
+              tr -d '[:space:]:' |
+              tr '[:upper:]' '[:lower:]'
+          })"
+          [[ "$expected_cert" =~ ^[0-9a-f]{64}$ ]]
+          actual_cert="$({
+            keytool -exportcert \
+              -keystore android/venera-community-release.jks \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" |
+              openssl dgst -sha256 -binary |
+              xxd -p -c 256
+          })"
+          test "$actual_cert" = "$expected_cert"
+          printf 'EXPECTED_SIGNING_CERT_SHA256=%s\n' "$expected_cert" >> "$GITHUB_ENV"
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build apk --release --no-pub
+      - name: Verify signed APKs and create checksums
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apks=(build/app/outputs/apk/release/*.apk)
+          (( ${#apks[@]} > 0 ))
+          for apk in "${apks[@]}"; do
+            verification="$({
+              "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify \
+                --verbose --print-certs "$apk"
+            })"
+            printf '%s\n' "$verification"
+            actual_cert="$({
+              printf '%s\n' "$verification" |
+                sed -n 's/^Signer #1 certificate SHA-256 digest: //p' |
+                tr -d '[:space:]:' |
+                tr '[:upper:]' '[:lower:]'
+            })"
+            test "$actual_cert" = "$EXPECTED_SIGNING_CERT_SHA256"
+          done
+          zip -9 -j \
+            build/app/outputs/apk/release/venera-community-r8-mapping.zip \
+            build/app/outputs/mapping/release/mapping.txt \
+            build/app/outputs/mapping/release/configuration.txt \
+            build/app/outputs/mapping/release/resources.txt \
+            build/app/outputs/mapping/release/usage.txt
+          (
+            cd build/app/outputs/apk/release
+            sha256sum ./*.apk ./venera-community-r8-mapping.zip > SHA256SUMS
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: venera-community-apks
+          path: |
+            build/app/outputs/apk/release/*.apk
+            build/app/outputs/apk/release/venera-community-r8-mapping.zip
+            build/app/outputs/apk/release/SHA256SUMS
+          if-no-files-found: error
+      - name: Preserve R8 mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: venera-community-r8-mapping
+          path: build/app/outputs/mapping/release/mapping.txt
+          if-no-files-found: error
+      - name: Create draft GitHub release and attach verified assets
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            build/app/outputs/apk/release/*.apk
+            build/app/outputs/apk/release/venera-community-r8-mapping.zip
+            build/app/outputs/apk/release/SHA256SUMS
+      - name: Publish GitHub release after all assets are attached
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"

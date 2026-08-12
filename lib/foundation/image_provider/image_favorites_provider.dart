@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
+import 'package:venera/foundation/image_favorite_support.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/network/images.dart';
 import 'package:venera/utils/io.dart';
@@ -32,12 +33,18 @@ class ImageFavoritesProvider
     StreamController<ImageChunkEvent>? chunkEvents,
     void Function()? checkStop,
   ) async {
+    return loadLocalImageOrFallback(
+      loadLocal: getImageFromLocal,
+      afterLocalAttempt: checkStop,
+      loadFallback: () => _loadFromCacheOrNetwork(chunkEvents, checkStop),
+    );
+  }
+
+  Future<Uint8List> _loadFromCacheOrNetwork(
+    StreamController<ImageChunkEvent>? chunkEvents,
+    void Function()? checkStop,
+  ) async {
     var imageKey = imageFavorite.imageKey;
-    var localImage = await getImageFromLocal();
-    checkStop?.call();
-    if (localImage != null) {
-      return localImage;
-    }
     var cacheImage = await readFromCache();
     checkStop?.call();
     if (cacheImage != null) {
@@ -67,47 +74,105 @@ class ImageFavoritesProvider
   Future<void> writeToCache(Uint8List image) async {
     var fileName = md5.convert(key.codeUnits).toString();
     var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
-    if (!file.existsSync()) {
-      file.createSync(recursive: true);
+    if (!await file.exists()) {
+      await file.create(recursive: true);
     }
     await file.writeAsBytes(image);
   }
 
   Future<Uint8List?> readFromCache() async {
-    var fileName = md5.convert(key.codeUnits).toString();
-    var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
-    if (!file.existsSync()) {
+    final current = await _readCacheFile(key);
+    if (current != null) {
+      return current;
+    }
+
+    // A legacy cache without page is safe only when imageKey identifies the
+    // image. Empty-key favorites from different pages shared one legacy key.
+    if (!canReadLegacyImageFavoriteCache(imageFavorite.imageKey)) {
       return null;
     }
-    return await file.readAsBytes();
+    final legacy = await _readCacheFile(
+      legacyImageFavoriteCacheIdentity(
+        imageKey: imageFavorite.imageKey,
+        sourceKey: imageFavorite.sourceKey,
+        comicId: imageFavorite.id,
+        episodeId: imageFavorite.eid,
+      ),
+    );
+    if (legacy != null) {
+      await writeToCache(legacy);
+    }
+    return legacy;
+  }
+
+  static Future<Uint8List?> _readCacheFile(String cacheKey) async {
+    final fileName = md5.convert(cacheKey.codeUnits).toString();
+    final file = File(
+      FilePath.join(App.cachePath, 'image_favorites', fileName),
+    );
+    if (!await file.exists()) {
+      return null;
+    }
+    return nonEmptyImageDataOrNull(await file.readAsBytes());
   }
 
   /// Delete a image favorite cache
   static Future<void> deleteFromCache(ImageFavorite imageFavorite) async {
-    var fileName = md5.convert(imageFavorite.imageKey.codeUnits).toString();
-    var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
-    if (file.existsSync()) {
-      await file.delete();
+    final cacheKeys = <String>{
+      imageFavoriteCacheIdentity(
+        imageKey: imageFavorite.imageKey,
+        sourceKey: imageFavorite.sourceKey,
+        comicId: imageFavorite.id,
+        episodeId: imageFavorite.eid,
+        page: imageFavorite.page,
+      ),
+      // Clean up files written by versions whose provider key omitted page.
+      legacyImageFavoriteCacheIdentity(
+        imageKey: imageFavorite.imageKey,
+        sourceKey: imageFavorite.sourceKey,
+        comicId: imageFavorite.id,
+        episodeId: imageFavorite.eid,
+      ),
+    };
+    for (final cacheKey in cacheKeys) {
+      final fileName = md5.convert(cacheKey.codeUnits).toString();
+      final file = File(
+        FilePath.join(App.cachePath, 'image_favorites', fileName),
+      );
+      if (await file.exists()) {
+        await file.delete();
+      }
     }
   }
 
   Future<Uint8List?> getImageFromLocal() async {
-    var localComic =
-        LocalManager().find(sourceKey, ComicType.fromKey(sourceKey));
+    final comicType = ComicType.fromKey(sourceKey);
+    final localComic = LocalManager().find(cid, comicType);
     if (localComic == null) {
       return null;
     }
-    var epIndex = localComic.chapters?.ids.toList().indexOf(eid) ?? -1;
-    if (epIndex == -1 && localComic.hasChapters) {
+
+    final chapter = resolveDownloadedFavoriteChapter(
+      hasChapters: localComic.hasChapters,
+      chapterIds: localComic.chapters?.ids.toList(),
+      downloadedChapterIds: localComic.downloadedChapters,
+      episodeId: eid,
+    );
+    if (chapter == null) {
       return null;
     }
-    var images = await LocalManager().getImages(
-      sourceKey,
-      ComicType.fromKey(sourceKey),
-      epIndex,
-    );
-    var data = await File(images[page]).readAsBytes();
-    return data;
+
+    final images = await LocalManager().getImages(cid, comicType, chapter);
+    final path = resolveLocalFavoriteImagePath(imageKeys: images, page: page);
+    if (path == null) {
+      return null;
+    }
+
+    final file = File(path);
+    if (!await file.exists()) {
+      return null;
+    }
+    return nonEmptyImageDataOrNull(await file.readAsBytes());
   }
 
   Future<Uint8List> getImageFromNetwork(
@@ -115,14 +180,20 @@ class ImageFavoritesProvider
     StreamController<ImageChunkEvent>? chunkEvents,
     void Function()? checkStop,
   ) async {
-    await for (var progress
-        in ImageDownloader.loadComicImage(imageKey, sourceKey, cid, eid)) {
+    await for (var progress in ImageDownloader.loadComicImage(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+    )) {
       checkStop?.call();
       if (chunkEvents != null) {
-        chunkEvents.add(ImageChunkEvent(
-          cumulativeBytesLoaded: progress.currentBytes,
-          expectedTotalBytes: progress.totalBytes,
-        ));
+        chunkEvents.add(
+          ImageChunkEvent(
+            cumulativeBytesLoaded: progress.currentBytes,
+            expectedTotalBytes: progress.totalBytes,
+          ),
+        );
       }
       if (progress.imageBytes != null) {
         return progress.imageBytes!;
@@ -150,6 +221,11 @@ class ImageFavoritesProvider
   }
 
   @override
-  String get key =>
-      "ImageFavorites ${imageFavorite.imageKey}@${imageFavorite.sourceKey}@${imageFavorite.id}@${imageFavorite.eid}";
+  String get key => imageFavoriteCacheIdentity(
+    imageKey: imageFavorite.imageKey,
+    sourceKey: imageFavorite.sourceKey,
+    comicId: imageFavorite.id,
+    episodeId: imageFavorite.eid,
+    page: imageFavorite.page,
+  );
 }

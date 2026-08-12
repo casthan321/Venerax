@@ -426,6 +426,7 @@
     "Delete Chapters": "删除章节",
     "Open Folder": "打开文件夹",
     "Path copied to clipboard": "路径已复制到剪贴板",
+    "Folder could not be opened. Path copied to clipboard.": "无法打开文件夹，路径已复制到剪贴板。",
     "Reverse default chapter order": "反转默认章节顺序",
     "Reload Configs": "重新加载配置文件",
     "Reload": "重载",
@@ -439,7 +440,15 @@
     "Clear specific reader settings for this device": "清除该设备的特殊阅读设置",
     "Enable device specific settings": "启用此设备特定设置",
     "Ignore Certificate Errors": "忽略证书错误",
-    "Mouse scroll speed": "鼠标滚动速度"
+    "Mouse scroll speed": "鼠标滚动速度",
+    "Host cannot be empty": "代理主机不能为空",
+    "Port must be a number": "代理端口必须是数字",
+    "Username cannot be empty": "代理用户名不能为空",
+    "Proxy port must be between 1 and 65535": "代理端口必须介于 1 到 65535 之间",
+    "Invalid manual proxy": "手动代理配置无效",
+    "Invalid proxy host": "代理主机无效",
+    "Invalid manual proxy credentials": "代理凭据无效",
+    "Unsupported proxy scheme": "不支持的代理协议"
   },
   "zh_TW": {
     "Home": "首頁",
@@ -868,6 +877,7 @@
     "Delete Chapters": "刪除章節",
     "Open Folder": "打開資料夾",
     "Path copied to clipboard": "路徑已複製到剪貼簿",
+    "Folder could not be opened. Path copied to clipboard.": "無法開啟資料夾，路徑已複製到剪貼簿。",
     "Reverse default chapter order": "反轉預設章節順序",
     "Reload Configs": "重新載入設定檔",
     "Reload": "重載",
@@ -881,6 +891,14 @@
     "Clear specific reader settings for this device": "清除該裝置的特殊閱讀設定",
     "Enable device specific settings": "啟用此裝置特定設定",
     "Ignore Certificate Errors": "忽略證書錯誤",
-    "Mouse scroll speed": "滑鼠滾動速度"
+    "Mouse scroll speed": "滑鼠滾動速度",
+    "Host cannot be empty": "代理主機不能為空",
+    "Port must be a number": "代理連接埠必須是數字",
+    "Username cannot be empty": "代理使用者名稱不能為空",
+    "Proxy port must be between 1 and 65535": "代理連接埠必須介於 1 到 65535 之間",
+    "Invalid manual proxy": "手動代理設定無效",
+    "Invalid proxy host": "代理主機無效",
+    "Invalid manual proxy credentials": "代理憑證無效",
+    "Unsupported proxy scheme": "不支援的代理協定"
   }
 }
