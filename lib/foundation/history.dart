@@ -27,6 +27,30 @@ const _insertHistorySql = """
   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """;
 
+const _historyWriteLockTimeout = Duration(seconds: 5);
+const _historyWriteRetryDelay = Duration(milliseconds: 50);
+
+Future<void> _executeHistoryWriteWithLockRetry(
+  Database database,
+  List<Object?> values,
+) async {
+  final elapsed = Stopwatch()..start();
+  while (true) {
+    try {
+      database.execute(_insertHistorySql, values);
+      return;
+    } on SqliteException catch (error) {
+      final isLockContention =
+          error.resultCode == SqlError.SQLITE_BUSY ||
+          error.resultCode == SqlError.SQLITE_LOCKED;
+      if (!isLockContention || elapsed.elapsed >= _historyWriteLockTimeout) {
+        rethrow;
+      }
+      await Future<void>.delayed(_historyWriteRetryDelay);
+    }
+  }
+}
+
 /// Writes a history row on an isolate-owned database connection.
 ///
 /// A sqlite connection must not be shared across isolates. The database path
@@ -38,13 +62,16 @@ Future<void> writeHistoryToDatabaseInIsolate(
   List<Object?> values, {
   Database Function(String path)? openDatabase,
 }) {
-  return Isolate.run(() {
+  return Isolate.run(() async {
     final db = (openDatabase ?? sqlite3.open)(databasePath);
     try {
       // The UI isolate may briefly hold a read/write transaction. Waiting is
-      // preferable to dropping the reader's progress with SQLITE_BUSY.
-      db.execute('PRAGMA busy_timeout = 5000;');
-      db.execute(_insertHistorySql, values);
+      // preferable to dropping the reader's progress with SQLITE_BUSY. Some
+      // SQLite builds return BUSY while preparing under an exclusive lock
+      // without invoking the busy handler, so retain a short native timeout
+      // and also retry those two lock-contention result codes explicitly.
+      db.execute('PRAGMA busy_timeout = 250;');
+      await _executeHistoryWriteWithLockRetry(db, values);
     } finally {
       db.dispose();
     }

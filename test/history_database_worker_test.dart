@@ -122,10 +122,16 @@ void main() {
       10,
       null,
     ], openDatabase: _openTestDatabase);
-    await Future<void>.delayed(const Duration(milliseconds: 100));
+    final completion = expectLater(
+      write.timeout(const Duration(seconds: 3)),
+      completes,
+    );
+    // Hold the lock longer than the worker's native busy timeout so the
+    // explicit BUSY/LOCKED retry path is exercised on every platform.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
     mainDatabase.execute('COMMIT;');
 
-    await write;
+    await completion;
     expect(mainDatabase.select('select count(*) from history;').single[0], 1);
   });
 
