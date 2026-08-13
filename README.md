@@ -1,7 +1,8 @@
 # Venera Community
 
-Venera Community 是归档项目 [Venera](https://github.com/venera-app/venera) 的非官方社区维护分支，保留原项目的 GPL-3.0 许可与作者署名。本分支优先处理可复现的阅读、下载、同步和本地文件缺陷。远项目归档，fork后由我接手修复bug。
-暂时修复了已知bug
+Venera Community 是归档项目 [Venera](https://github.com/venera-app/venera) 的非官方社区维护分支，保留原项目的 GPL-3.0 许可与作者署名。本分支优先处理可复现的阅读、下载、同步和本地文件缺陷。
+原项目已归档，fork后由我接手修复bug。
+暂时修复了已知bug。
 
 > 本项目与原作者及上游项目没有官方隶属关系。Android 包名为
 > `io.github.casthan321.venera`，可与原版 `com.github.wgh136.venera` 同时安装。
