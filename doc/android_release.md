@@ -40,7 +40,7 @@ copies of the community app.
 
 ## GitHub Actions secrets
 
-Configure these secrets in `casthan321/Venerax`:
+Configure these secrets in `casthan321/Venera-Community`:
 
 - `ANDROID_KEYSTORE_BASE64`: base64-encoded bytes of the permanent keystore.
 - `ANDROID_KEYSTORE_PASSWORD`: keystore password.

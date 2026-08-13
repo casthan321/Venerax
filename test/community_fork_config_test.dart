@@ -51,4 +51,25 @@ void main() {
     );
     expect(source, isNot(contains('release:\n    types: [published]')));
   });
+
+  test('community project links use the canonical repository name', () {
+    const canonicalRepository = 'casthan321/Venera-Community';
+    const previousRepository = 'casthan321/Venerax';
+    final projectLinks = <String>[
+      File('README.md').readAsStringSync(),
+      File('doc/android_release.md').readAsStringSync(),
+      File('lib/pages/settings/about.dart').readAsStringSync(),
+      File('pubspec.yaml').readAsStringSync(),
+    ];
+
+    expect(projectLinks, everyElement(contains(canonicalRepository)));
+    expect(projectLinks, everyElement(isNot(contains(previousRepository))));
+  });
+
+  test('workflows do not depend on the previous checkout directory', () {
+    final workflow = File('.github/workflows/main.yml').readAsStringSync();
+
+    expect(workflow, isNot(contains('/Users/runner/work/venera/venera')));
+    expect(workflow, contains('mkdir -p build/ios/iphoneos/Payload'));
+  });
 }

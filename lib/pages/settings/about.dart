@@ -70,7 +70,7 @@ class _AboutSettingsState extends State<AboutSettings> {
           title: const Text("GitHub (Community Fork)"),
           trailing: const Icon(Icons.open_in_new),
           onTap: () {
-            launchUrlString("https://github.com/casthan321/Venerax");
+            launchUrlString("https://github.com/casthan321/Venera-Community");
           },
         ).toSliver(),
         ListTile(
@@ -87,7 +87,7 @@ class _AboutSettingsState extends State<AboutSettings> {
 
 Future<bool> checkUpdate() async {
   var res = await AppDio().get(
-    "https://raw.githubusercontent.com/casthan321/Venerax/master/pubspec.yaml",
+    "https://raw.githubusercontent.com/casthan321/Venera-Community/master/pubspec.yaml",
   );
   if (res.statusCode == 200) {
     var data = loadYaml(res.data);
@@ -121,7 +121,7 @@ Future<void> checkUpdateUi([
                 onPressed: () {
                   Navigator.pop(context);
                   launchUrlString(
-                    "https://github.com/casthan321/Venerax/releases",
+                    "https://github.com/casthan321/Venera-Community/releases",
                   );
                 },
                 child: Text("Update".tl),

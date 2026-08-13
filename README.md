@@ -8,9 +8,9 @@ Venera Community 是归档项目 [Venera](https://github.com/venera-app/venera) 
 > `io.github.casthan321.venera`，可与原版 `com.github.wgh136.venera` 同时安装。
 
 [![flutter](https://img.shields.io/badge/flutter-3.41.4-blue)](https://flutter.dev/)
-[![License](https://img.shields.io/github/license/casthan321/Venerax)](LICENSE)
-[![Android](https://github.com/casthan321/Venerax/actions/workflows/android.yml/badge.svg)](https://github.com/casthan321/Venerax/actions/workflows/android.yml)
-[![Download](https://img.shields.io/github/v/release/casthan321/Venerax)](https://github.com/casthan321/Venerax/releases)
+[![License](https://img.shields.io/github/license/casthan321/Venera-Community)](LICENSE)
+[![Android](https://github.com/casthan321/Venera-Community/actions/workflows/android.yml/badge.svg)](https://github.com/casthan321/Venera-Community/actions/workflows/android.yml)
+[![Download](https://img.shields.io/github/v/release/casthan321/Venera-Community)](https://github.com/casthan321/Venera-Community/releases)
 
 A comic reader that support reading local and network comics.
 
