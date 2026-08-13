@@ -483,18 +483,29 @@ class _GalleryModeState extends State<_GalleryMode>
             photoViewControllers[index] ??= PhotoViewController();
 
             if (reader.imagesPerPage == 1 || pageImages.length == 1) {
-              return PhotoViewGalleryPageOptions(
-                filterQuality: FilterQuality.medium,
-                controller: photoViewControllers[index],
-                imageProvider: _createImageProviderFromKey(
-                  pageImages[0],
-                  context,
-                  startIndex + 1,
+              // The image branch in our photo_view fork resets its private
+              // loading flag from didChangeDependencies. When the same image
+              // stream is resolved again (for example after hiding the reader
+              // toolbar changes MediaQuery), it returns early without clearing
+              // that flag and leaves an already-loaded page behind a spinner.
+              // The custom-child branch keeps PhotoView's pan/zoom behavior but
+              // lets ComicImage own the stable image stream instead.
+              final viewportSize = MediaQuery.sizeOf(context);
+              return buildStableGalleryImagePage(
+                viewportSize: viewportSize,
+                controller: photoViewControllers[index]!,
+                child: ComicImage(
+                  width: viewportSize.width,
+                  height: viewportSize.height,
+                  image: _createImageProviderFromKey(
+                    pageImages[0],
+                    context,
+                    startIndex + 1,
+                  ),
+                  fit: BoxFit.contain,
+                  onInit: (state) => imageStates.add(state),
+                  onDispose: (state) => imageStates.remove(state),
                 ),
-                fit: BoxFit.contain,
-                errorBuilder: (_, error, s, retry) {
-                  return NetworkError(message: error.toString(), retry: retry);
-                },
               );
             }
 
@@ -874,7 +885,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
   var fingers = 0;
   bool disableScroll = false;
 
-  late List<bool> cached;
+  late List<bool> preDownloadRequested;
+  late List<bool> preCacheRequested;
 
   int get preCacheCount => appdata.settings["preloadImageCount"];
 
@@ -895,11 +907,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
     reader = context.reader;
     reader._imageViewController = this;
     itemPositionsListener.itemPositions.addListener(onPositionChanged);
-    cached = List.filled(reader.maxPage + 2, false);
-    Future.delayed(
-      const Duration(milliseconds: 100),
-      () => cacheImages(reader.page),
-    );
+    preDownloadRequested = List.filled(reader.maxPage + 2, false);
+    preCacheRequested = List.filled(reader.maxPage + 2, false);
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted) cacheImages(reader.page);
+    });
     super.initState();
   }
 
@@ -982,10 +994,24 @@ class _ContinuousModeState extends State<_ContinuousMode>
   }
 
   void cacheImages(int current) {
-    for (int i = current + 1; i <= current + preCacheCount; i++) {
-      if (i <= reader.maxPage && !cached[i]) {
-        _preDownloadImage(i, context);
-        cached[i] = true;
+    final plan = planContinuousImagePreload(
+      currentPage: current,
+      maxPage: reader.maxPage,
+      preloadCount: preCacheCount,
+    );
+    final preCachePage = plan.preCachePage;
+    if (preCachePage != null && !preCacheRequested[preCachePage]) {
+      // Decoding the nearest page before it enters the viewport avoids the
+      // placeholder-to-image relayout and texture upload landing on the same
+      // frame as the user's scroll. Keep this to one page to bound memory.
+      _precacheImage(preCachePage, context);
+      preCacheRequested[preCachePage] = true;
+      preDownloadRequested[preCachePage] = true;
+    }
+    for (final page in plan.preDownloadPages) {
+      if (!preDownloadRequested[page]) {
+        _preDownloadImage(page, context);
+        preDownloadRequested[page] = true;
       }
     }
   }
@@ -1410,7 +1436,7 @@ ImageProvider _createImageProviderFromKey(
     reader.type.comicSource?.key,
     reader.cid,
     reader.eid,
-    reader.page,
+    page,
     enableResize: reader
         .mode
         .isContinuous, // For continuous mode, we need to resize the image to improve performance
@@ -1447,7 +1473,18 @@ void _preDownloadImage(int page, BuildContext context) {
   var cid = reader.cid;
   var eid = reader.eid;
   var sourceKey = reader.type.comicSource?.key;
-  ImageDownloader.loadComicImage(imageKey, sourceKey, cid, eid);
+  // Subscribe so the shared stream does not buffer every progress event in
+  // an unlistened StreamController while warming distant pages.
+  unawaited(
+    ImageDownloader.loadComicImage(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+    ).drain<void>().catchError((Object error, StackTrace stackTrace) {
+      Log.error('Reader image pre-download', error, stackTrace);
+    }),
+  );
 }
 
 class _SwipeChangeChapterProgress extends StatefulWidget {

@@ -14,6 +14,8 @@ silently counted as defects.
 | Area | Upstream reports | Community-fork coverage |
 | --- | --- | --- |
 | Reader progress | User-reported regression | Continuous-mode progress seeking now commits once and uses a non-animated jump, preventing a re-entrant `scrollTo` future from leaving the reader input lock active. |
+| Gallery progress return | User-reported regression | Gallery pages use the stable project image lifecycle inside PhotoView, so closing the toolbar after a progress jump cannot replace an already-loaded image with a permanent loading indicator. |
+| Continuous image loading | User-reported performance regression, [#520](https://github.com/venera-app/venera/issues/520) | The nearest page is decoded before entering the viewport while farther pages remain compressed on disk. Cached images no longer trigger a redundant network request, and network chunks use a bounded-copy byte builder. |
 | Reader gesture animation | [#745](https://github.com/venera-app/venera/issues/745) | Disabling page animation now also disables gallery swipe ballistics while preserving horizontal, RTL and vertical navigation. |
 | Reader chapter loading | [#772](https://github.com/venera-app/venera/issues/772), [#825](https://github.com/venera-app/venera/issues/825) | Stale history pages are clamped after the real image count is known, and a comic-source call that never completes becomes a retryable timeout instead of an endless spinner. |
 | Download state | [#813](https://github.com/venera-app/venera/issues/813), [#707](https://github.com/venera-app/venera/issues/707), [#799](https://github.com/venera-app/venera/issues/799), [#766](https://github.com/venera-app/venera/issues/766) | A task cannot complete until every selected chapter has a non-empty image list and every expected page exists. Image-list calls time out, partial resumes are reconstructed from disk, and stale continuations cannot complete a newer run. Images and covers are committed through flushed temporary files. |
@@ -41,12 +43,12 @@ separately before an APK is published.
 
 ## Validation snapshot
 
-The current tree passes `flutter analyze` and all 138 Flutter tests on Flutter
+The current tree passes `flutter analyze` and all 143 Flutter tests on Flutter
 3.41.4 / Dart 3.11.1. A clean Android release build also completed with R8
 enabled and produced the universal, armeabi-v7a, arm64-v8a and x86_64 APKs.
 
 The permanent release-key build verified package id
-`io.github.casthan321.venera`, version codes 1640–1643, the independent
+`io.github.casthan321.venera`, version codes 1650–1653, the independent
 `Venera Community` label and launcher icon, application-scoped provider
 authorities, removal of the upstream web-link handlers, preservation of the
 text-share entry, APK Signature Scheme v2 verification, and generation of the

@@ -153,6 +153,7 @@ abstract class ImageDownloader {
         totalBytes: data.length,
         imageBytes: data,
       );
+      return;
     }
 
     Future<Map<String, dynamic>?> Function()? onLoadFailed;
@@ -201,37 +202,35 @@ abstract class ImageDownloader {
         if (expectedBytes == -1) {
           expectedBytes = null;
         }
-        var buffer = <int>[];
+        final buffer = BytesBuilder(copy: false);
+        var receivedBytes = 0;
         await for (var data in stream) {
-          buffer.addAll(data);
+          buffer.add(data);
+          receivedBytes += data.length;
           yield ImageDownloadProgress(
-            currentBytes: buffer.length,
+            currentBytes: receivedBytes,
             totalBytes: expectedBytes,
           );
         }
 
+        Uint8List imageBytes = buffer.takeBytes();
+
         if (configs['onResponse'] is JSInvokable) {
-          dynamic result = (configs['onResponse'] as JSInvokable)([
-            Uint8List.fromList(buffer),
-          ]);
+          dynamic result = (configs['onResponse'] as JSInvokable)([imageBytes]);
           if (result is Future) {
             result = await result;
           }
           if (result is List<int>) {
-            buffer = result;
+            imageBytes = result is Uint8List
+                ? result
+                : Uint8List.fromList(result);
           } else {
             throw "Error: Invalid onResponse result.";
           }
           (configs['onResponse'] as JSInvokable).free();
         }
 
-        Uint8List data;
-        if (buffer is Uint8List) {
-          data = buffer;
-        } else {
-          data = Uint8List.fromList(buffer);
-          buffer.clear();
-        }
+        var data = imageBytes;
 
         if (configs['modifyImage'] != null && !isGifImage(data)) {
           var newData = await modifyImageWithScript(
