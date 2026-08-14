@@ -91,17 +91,19 @@ file, or chat transcript.
 6. Install a second community build with the same certificate and a higher
    version code using `adb install -r`; it must update in place without
    affecting the upstream app.
-7. Push the reviewed `v1.7.0` tag. The Android workflow builds and verifies the
-   commit, creates a draft release, attaches the universal and ABI-specific
-   APKs, `SHA256SUMS`, and the compressed R8 mapping, then publishes the release
-   only after every asset has been attached.
+7. Push the reviewed `v<project-version>` tag, exactly matching the version in
+   `pubspec.yaml` without its build metadata. The Android workflow builds and
+   verifies the commit, creates a draft release, attaches the universal and
+   ABI-specific APKs, `SHA256SUMS`, and the compressed R8 mapping, then publishes
+   the release only after every asset has been attached.
 8. Verify the attached checksums and signing-certificate SHA-256 digest again.
    Archive the release's R8 mapping with the source tag.
 
-The v1.7.0 universal APK has version code 1710. ABI-specific codes are 1711
-(armeabi-v7a), 1712 (arm64-v8a), and 1713 (x86_64). Keep future codes strictly
-higher across every distribution format; do not publish the debug code 1714 as
-an update candidate.
+Release version codes are derived from the `pubspec.yaml` build number: the
+universal APK uses `buildNumber * 10`, followed by offsets 1, 2, and 3 for
+armeabi-v7a, arm64-v8a, and x86_64. Before publishing, confirm every generated
+code is strictly higher than every previously distributed APK. The debug offset
+4 must never be published as an update candidate.
 
 Temporary or smoke certificates are suitable only for build validation. APKs
 signed by them must never be attached to a public release.

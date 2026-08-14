@@ -35,16 +35,16 @@ void main() {
   test('stable users only receive prereleases after opting in', () {
     expect(
       shouldOfferVersionUpdate(
-        candidate: '1.7.0-beta.1',
-        current: '1.6.5',
+        candidate: '1.8.0-beta.1+180',
+        current: '1.7.0+171',
         allowPreRelease: false,
       ),
       isFalse,
     );
     expect(
       shouldOfferVersionUpdate(
-        candidate: '1.7.0-beta.1',
-        current: '1.6.5',
+        candidate: '1.8.0-beta.1+180',
+        current: '1.7.0+171',
         allowPreRelease: true,
       ),
       isTrue,
@@ -54,8 +54,8 @@ void main() {
   test('prerelease installations continue receiving beta updates', () {
     expect(
       shouldOfferVersionUpdate(
-        candidate: '1.7.0-beta.2',
-        current: '1.7.0-beta.1',
+        candidate: '1.8.0-beta.2+181',
+        current: '1.8.0-beta.1+180',
         allowPreRelease: false,
       ),
       isTrue,
