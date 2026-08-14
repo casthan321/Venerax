@@ -88,5 +88,6 @@ void main() {
       cmake,
       contains('_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS'),
     );
+    expect(cmake, contains('add_compile_definitions('));
   });
 }

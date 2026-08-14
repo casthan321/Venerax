@@ -32,6 +32,14 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# C++/WinRT dependencies used by several plugins still rely on the /await
+# compatibility path. MSVC 14.51 turns its experimental-coroutine deprecation
+# into a hard error. Define the documented transition macro at directory scope
+# so plugin subdirectories inherit it even when they do not call
+# apply_standard_settings.
+add_compile_definitions(
+  _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
@@ -41,11 +49,6 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100" /wd4267)
   target_compile_options(${TARGET} PRIVATE /EHsc)
-  # local_auth_windows 2.0.1 still uses C++/WinRT's /await compatibility
-  # path. MSVC 14.51 turns the experimental-coroutine deprecation into a
-  # hard error unless this documented transition macro is defined.
-  target_compile_definitions(${TARGET} PRIVATE
-    "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
 endfunction()
