@@ -27,8 +27,15 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          project_version="$(sed -n 's/^version:[[:space:]]*\([^+[:space:]]*\).*$/\1/p' pubspec.yaml)"
+          full_version="$(sed -n 's/^version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' pubspec.yaml)"
+          project_version="${full_version%%+*}"
+          build_number="${full_version#*+}"
+          app_version="$(sed -n 's/.*final version = "\([^"]*\)";.*/\1/p' lib/foundation/app.dart)"
+          test -n "$full_version"
           test -n "$project_version"
+          test "$full_version" != "$project_version"
+          [[ "$build_number" =~ ^[0-9]+$ ]]
+          test "$app_version" = "$project_version"
           test "$GITHUB_REF_NAME" = "v$project_version"
           test -s "doc/releases/$GITHUB_REF_NAME.md"
       - uses: actions/setup-java@v4
@@ -280,6 +287,7 @@ jobs:
       - name: Create draft GitHub release and attach verified assets
         uses: softprops/action-gh-release@v2
         with:
+          name: Venera Community ${{ github.ref_name }}
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: doc/releases/${{ github.ref_name }}.md

@@ -61,4 +61,18 @@ void main() {
       isTrue,
     );
   });
+
+  test('stable release is offered to old stable and beta installations', () {
+    for (final current in ['1.6.4', '1.6.5', '1.7.0-beta.1']) {
+      expect(
+        shouldOfferVersionUpdate(
+          candidate: '1.7.0+171',
+          current: current,
+          allowPreRelease: false,
+        ),
+        isTrue,
+        reason: '1.7.0 should be offered to $current',
+      );
+    }
+  });
 }

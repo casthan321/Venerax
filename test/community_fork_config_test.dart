@@ -60,6 +60,8 @@ void main() {
       source,
       contains("prerelease: \${{ contains(github.ref_name, '-') }}"),
     );
+    expect(source, contains('name: Venera Community \${{ github.ref_name }}'));
+    expect(source, contains('test "\$app_version" = "\$project_version"'));
     expect(
       source,
       contains(
@@ -83,14 +85,15 @@ void main() {
     expect(projectLinks, everyElement(isNot(contains(previousRepository))));
   });
 
-  test('Beta version metadata and release notes stay in sync', () {
+  test('Stable version metadata and release notes stay in sync', () {
     final pubspec =
         loadYaml(File('pubspec.yaml').readAsStringSync()) as YamlMap;
     final fullVersion = pubspec['version'] as String;
     final versionName = fullVersion.split('+').first;
     final appSource = File('lib/foundation/app.dart').readAsStringSync();
 
-    expect(versionName, '1.7.0-beta.1');
+    expect(fullVersion, '1.7.0+171');
+    expect(versionName, '1.7.0');
     expect(appSource, contains('final version = "$versionName"'));
     expect(File('doc/releases/v$versionName.md').lengthSync(), greaterThan(0));
   });

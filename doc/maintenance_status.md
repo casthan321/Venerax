@@ -3,7 +3,7 @@
 This document records what the community fork has actually verified. It is not
 a claim that every open upstream issue has been fixed.
 
-Snapshot: 2026-08-13, based on upstream commit
+Snapshot: 2026-08-14, based on upstream commit
 [`a0eba91`](https://github.com/venera-app/venera/commit/a0eba914f4c2a84ac1bc925adec2baabe920b9be).
 The archived upstream repository had 142 open issues: 42 labelled `bug` and 100
 labelled `enhancement`. Enhancement requests remain a roadmap and are not
@@ -43,23 +43,25 @@ separately before an APK is published.
 
 ## Validation snapshot
 
-The current tree passes `flutter analyze` and all 143 Flutter tests on Flutter
-3.41.4 / Dart 3.11.1. A clean Android release build also completed with R8
-enabled and produced the universal, armeabi-v7a, arm64-v8a and x86_64 APKs.
+The release gate passes `flutter analyze` and the complete Flutter test suite on
+Flutter 3.41.4 / Dart 3.11.1. Clean Android and Windows x64 release builds also
+completed for the public beta, including the installer, universal APK and all
+three ABI-specific APKs.
 
 The permanent release-key build verified package id
-`io.github.casthan321.venera`, version codes 1650–1653, the independent
-`Venera Community` label and launcher icon, application-scoped provider
-authorities, removal of the upstream web-link handlers, preservation of the
-text-share entry, APK Signature Scheme v2 verification, and generation of the
-R8 `mapping.txt`. All four APKs were signed by the permanent certificate with
-SHA-256 fingerprint
+`io.github.casthan321.venera`. The v1.7.0 stable candidate uses version codes
+1710–1713, all higher than the beta's 1700–1703. The workflow also verifies the
+independent `Venera Community` label and launcher icon, application-scoped
+provider authorities, removal of the upstream web-link handlers, preservation
+of the text-share entry, APK Signature Scheme v2 verification, and generation
+of the R8 `mapping.txt`. All four APKs were signed by the permanent certificate
+with SHA-256 fingerprint
 `9cfcda753fddb426bb1b2b5078d140b00085508c937785bbf32c1cfc75a2ea37`.
 
-No Android device was connected during this snapshot. Installation alongside
-the upstream APK, provider conflict checks, storage access, and in-place
-community-fork upgrade still form the real-device release gate for the first
-public build.
+No Android device was connected during this automated snapshot. Installation
+alongside the upstream APK, provider conflict checks, removable-storage access,
+and in-place community-fork upgrades remain hardware validation boundaries and
+must not be inferred from CI alone.
 
 ## Implemented defensively; device or source validation still required
 
