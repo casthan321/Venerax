@@ -5,12 +5,19 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/comic_source/repository.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/atomic_file.dart';
 import 'package:venera/utils/coalescing_async_writer.dart';
 import 'package:venera/utils/init.dart';
 import 'package:venera/utils/io.dart';
+
+const _comicSourceRepositorySyncFields = <String>{
+  'comicSourceListUrl',
+  'comicSourceRepositories',
+  'comicSourceRepositoriesLegacyMirror',
+};
 
 @visibleForTesting
 Map<String, dynamic> mergeLocalAppdataForRestore(
@@ -137,6 +144,7 @@ class Appdata with Init {
     "webdav",
     "disableSyncFields",
     "deviceId",
+    "comicSourceLegacyUrlNeedsReview",
   ];
 
   /// Sync data from another device
@@ -147,12 +155,39 @@ class Appdata with Init {
       List<String> customDisableSync = splitField(
         this.settings["disableSyncFields"] as String,
       );
+      final repositoriesSyncDisabled = customDisableSync.any(
+        _comicSourceRepositorySyncFields.contains,
+      );
+      final bindingsSyncDisabled = customDisableSync.contains(
+        'comicSourceRepositoryBindings',
+      );
 
       for (var key in settings.keys) {
+        if (repositoriesSyncDisabled &&
+            (key == 'comicSourceListUrl' ||
+                key == 'comicSourceRepositories' ||
+                key == 'comicSourceRepositoriesLegacyMirror')) {
+          continue;
+        }
         if (!_disableSync.contains(key) && !customDisableSync.contains(key)) {
           this.settings[key] = settings[key];
         }
       }
+      final importsRepositorySettings =
+          !repositoriesSyncDisabled &&
+          settings.keys.any(_comicSourceRepositorySyncFields.contains);
+      if (importsRepositorySettings &&
+          settings.containsKey('comicSourceListUrl') &&
+          !settings.containsKey('comicSourceRepositories')) {
+        this.settings._data['comicSourceRepositories'] = null;
+      }
+      if (importsRepositorySettings &&
+          !bindingsSyncDisabled &&
+          !settings.containsKey('comicSourceRepositoryBindings')) {
+        this.settings._data['comicSourceRepositoryBindings'] =
+            <String, dynamic>{};
+      }
+      migrateComicSourceRepositorySettings(this.settings._data);
     }
     searchHistory = List.from(data['searchHistory'] ?? []);
     return saveData(upload);
@@ -165,6 +200,7 @@ class Appdata with Init {
     final snapshotSettings = snapshot['settings'];
     if (snapshotSettings is Map) {
       settings._replaceAll(Map<String, dynamic>.from(snapshotSettings));
+      migrateComicSourceRepositorySettings(settings._data);
     }
     searchHistory = List<String>.from(snapshot['searchHistory'] ?? const []);
     return saveData(false);
@@ -177,7 +213,19 @@ class Appdata with Init {
   /// the settings map wholesale.
   Future<void> restoreImportedData(Map<String, dynamic> imported) {
     final merged = mergeLocalAppdataForRestore(toJson(), imported);
-    settings._replaceAll(Map<String, dynamic>.from(merged['settings'] as Map));
+    final mergedSettings = Map<String, dynamic>.from(merged['settings'] as Map);
+    final importedSettings = imported['settings'];
+    if (importedSettings is Map &&
+        importedSettings.containsKey('comicSourceListUrl') &&
+        !importedSettings.containsKey('comicSourceRepositories')) {
+      mergedSettings['comicSourceRepositories'] = null;
+    }
+    if (importedSettings is Map &&
+        !importedSettings.containsKey('comicSourceRepositoryBindings')) {
+      mergedSettings['comicSourceRepositoryBindings'] = <String, dynamic>{};
+    }
+    settings._replaceAll(mergedSettings);
+    migrateComicSourceRepositorySettings(settings._data);
     searchHistory = List<String>.from(merged['searchHistory'] as List);
     return saveData(false);
   }
@@ -230,8 +278,13 @@ class Appdata with Init {
         file.deleteIgnoreError();
       }
     }
+    final migratedRepositories = migrateComicSourceRepositorySettings(
+      settings._data,
+    );
     if ((settings["deviceId"] as String).isEmpty) {
       settings._data["deviceId"] = const Uuid().v4();
+      await saveData(false);
+    } else if (migratedRepositories) {
       await saveData(false);
     }
     try {
@@ -268,7 +321,11 @@ Map<String, dynamic> sanitizedAppdataForSync(
   final copy = jsonDecode(jsonEncode(source)) as Map<String, dynamic>;
   final settings = copy['settings'];
   if (settings is Map<String, dynamic>) {
-    for (final field in disabledFields) {
+    final disabled = disabledFields.toSet();
+    if (disabled.any(_comicSourceRepositorySyncFields.contains)) {
+      disabled.addAll(_comicSourceRepositorySyncFields);
+    }
+    for (final field in disabled) {
       settings.remove(field);
     }
   }
@@ -327,7 +384,15 @@ class Settings with ChangeNotifier {
     'customImageProcessing': defaultCustomImageProcessing,
     'sni': true,
     'autoAddLanguageFilter': 'none', // none, chinese, english, japanese
-    'comicSourceListUrl': _defaultSourceListUrl,
+    'comicSourceListUrl': defaultComicSourceRepositoryUrl,
+    // Null is a migration sentinel. It lets an older installation's custom
+    // comicSourceListUrl become the first repository instead of being hidden
+    // by a newly introduced default list.
+    'comicSourceRepositories': null,
+    'comicSourceRepositoriesLegacyMirror': null,
+    'comicSourceSelectedRepositoryId': null,
+    'comicSourceLegacyUrlNeedsReview': null,
+    'comicSourceRepositoryBindings': <String, dynamic>{},
     'preloadImageCount': 4,
     'followUpdatesFolder': null,
     'initialPage': '0',
@@ -483,6 +548,3 @@ async function processImage(image, cid, eid, page, sourceKey) {
     return futureImage;
 }
 ''';
-
-const _defaultSourceListUrl =
-    "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";

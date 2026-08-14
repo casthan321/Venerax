@@ -403,8 +403,13 @@ void main() {
       request.response.headers.set('etag', '"resume-v1"');
       request.response.contentLength = range.$2 - range.$1 + 1;
       if (range != (0, 0)) {
-        if (isSecondRun) resumedOffsets.add(range.$1);
-        if (!firstActualRange.isCompleted) firstActualRange.complete();
+        if (isSecondRun) {
+          resumedOffsets.add(range.$1);
+        } else if (range.$1 > 0 && !firstActualRange.isCompleted) {
+          // maxConcurrent is one for the first run, so receiving the second
+          // block proves that the first block reached the random-access writer.
+          firstActualRange.complete();
+        }
       }
       for (var offset = range.$1; offset <= range.$2; offset += 2048) {
         final end = (offset + 2048).clamp(0, range.$2 + 1);
@@ -424,7 +429,6 @@ void main() {
     final firstDone = first.start().drain<void>();
 
     await firstActualRange.future;
-    await Future<void>.delayed(const Duration(milliseconds: 35));
     await first.stop();
     await firstDone;
 

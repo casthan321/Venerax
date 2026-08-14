@@ -7,10 +7,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_qjs/flutter_qjs.dart';
+import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/res.dart';
+import 'package:venera/foundation/comic_source/data_write_gate.dart';
 import 'package:venera/pages/category_comics_page.dart';
 import 'package:venera/pages/search_result_page.dart';
 import 'package:venera/utils/data_sync.dart';
@@ -18,6 +20,7 @@ import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/init.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/translations.dart';
+import 'package:venera/utils/atomic_file.dart';
 
 import '../js_engine.dart';
 import '../log.dart';
@@ -77,10 +80,25 @@ class ComicSourceManager with ChangeNotifier, Init {
     }
   }
 
-  Future<void> reload({bool failOnInvalidSource = false}) async {
+  Future<void> reload({
+    bool failOnInvalidSource = false,
+    bool preserveAvailableUpdates = false,
+  }) async {
+    final previousSources = List<ComicSource>.from(_sources);
+    await Future.wait(
+      previousSources.map((source) => source._retireDataWrites()),
+    );
     _sources.clear();
     JsEngine().runCode("ComicSource.sources = {};");
     await doInit();
+    if (preserveAvailableUpdates) {
+      final loadedKeys = _sources.map((source) => source.key).toSet();
+      _availableUpdates.removeWhere((key, _) => !loadedKeys.contains(key));
+      _availableUpdateUrls.removeWhere((key, _) => !loadedKeys.contains(key));
+    } else {
+      _availableUpdates.clear();
+      _availableUpdateUrls.clear();
+    }
     if (failOnInvalidSource && _loadFailures.isNotEmpty) {
       throw ComicSourceLoadException(List.unmodifiable(_loadFailures));
     }
@@ -92,22 +110,58 @@ class ComicSourceManager with ChangeNotifier, Init {
     notifyListeners();
   }
 
-  void remove(String key) {
+  void remove(String key, {bool clearUpdate = true}) {
+    for (final source in _sources.where((source) => source.key == key)) {
+      unawaited(source._retireDataWrites());
+    }
     _sources.removeWhere((element) => element.key == key);
+    if (clearUpdate) {
+      _availableUpdates.remove(key);
+      _availableUpdateUrls.remove(key);
+    }
     notifyListeners();
   }
 
   bool get isEmpty => _sources.isEmpty;
 
+  /// Stops and drains private-data writes for the current source generation.
+  /// Returns false when [expected] is no longer the installed instance.
+  Future<bool> retireDataWrites(String key, {ComicSource? expected}) async {
+    final current = find(key);
+    if (current == null ||
+        (expected != null && !identical(current, expected))) {
+      return false;
+    }
+    await current._retireDataWrites();
+    return true;
+  }
+
   /// Key is the source key, value is the version.
   final _availableUpdates = <String, String>{};
+  final _availableUpdateUrls = <String, String>{};
 
-  void updateAvailableUpdates(Map<String, String> updates) {
-    _availableUpdates.addAll(updates);
+  void replaceAvailableUpdates(
+    Map<String, String> updates, {
+    Map<String, String> downloadUrls = const <String, String>{},
+  }) {
+    _availableUpdates
+      ..clear()
+      ..addAll(updates);
+    _availableUpdateUrls
+      ..clear()
+      ..addAll(downloadUrls);
     notifyListeners();
   }
 
   Map<String, String> get availableUpdates => Map.from(_availableUpdates);
+
+  String? availableUpdateUrl(String key) => _availableUpdateUrls[key];
+
+  void clearAvailableUpdate(String key) {
+    final changed = _availableUpdates.remove(key) != null;
+    _availableUpdateUrls.remove(key);
+    if (changed) notifyListeners();
+  }
 
   void notifyStateChange() {
     notifyListeners();
@@ -128,6 +182,19 @@ class ComicSource {
   static List<ComicSource> all() => ComicSourceManager().all();
 
   static ComicSource? find(String key) => ComicSourceManager().find(key);
+
+  /// Resolves [key] only when it still belongs to the same loaded script
+  /// generation. Delayed callbacks from a replaced script must not acquire the
+  /// new source instance merely because it reuses the same public key.
+  static ComicSource? findGeneration(String key, String generation) {
+    final source = find(key);
+    return source?._generation == generation ? source : null;
+  }
+
+  static ComicSource requireGeneration(String key, String generation) {
+    return findGeneration(key, generation) ??
+        (throw const ComicSourceGenerationExpiredException());
+  }
 
   static ComicSource? fromIntKey(int key) =>
       ComicSourceManager().fromIntKey(key);
@@ -185,6 +252,8 @@ class ComicSource {
 
   final String version;
 
+  final String _generation;
+
   final CommentsLoader? commentsLoader;
 
   final SendCommentFunc? sendCommentFunc;
@@ -227,27 +296,22 @@ class ComicSource {
     }
   }
 
-  bool _isSaving = false;
-  bool _haveWaitingTask = false;
+  final ComicSourceDataWriteGate _dataWriteGate = ComicSourceDataWriteGate();
 
   Future<void> saveData() async {
-    if (_haveWaitingTask) return;
-    while (_isSaving) {
-      _haveWaitingTask = true;
-      await Future.delayed(const Duration(milliseconds: 20));
-      _haveWaitingTask = false;
-    }
-    _isSaving = true;
-    var file = File("${App.dataPath}/comic_source/$key.data");
-    if (!await file.exists()) {
-      await file.create(recursive: true);
-    }
-    await file.writeAsString(jsonEncode(data));
-    _isSaving = false;
-    DataSync().uploadData();
+    final wrote = await _dataWriteGate.run(() async {
+      if (!identical(ComicSourceManager().find(key), this)) return false;
+      final file = File("${App.dataPath}/comic_source/$key.data");
+      await writeStringAtomically(file, jsonEncode(data));
+      return true;
+    });
+    if (wrote) unawaited(DataSync().uploadData());
   }
 
+  Future<void> _retireDataWrites() => _dataWriteGate.retire();
+
   Future<bool> reLogin() async {
+    if (findGeneration(key, _generation) != this) return false;
     if (data["account"] == null) {
       return false;
     }
@@ -262,8 +326,15 @@ class ComicSource {
   /// Get settings dynamically from JavaScript source.
   /// This allows sources to use getters for dynamic settings that can change at runtime.
   Map<String, Map<String, dynamic>>? getSettingsDynamic() {
+    if (findGeneration(key, _generation) != this) return settings;
     try {
-      var value = JsEngine().runCode("ComicSource.sources.$key.settings");
+      var value = JsEngine().runCode(
+        buildComicSourceRuntimeInvocation(
+          key: key,
+          generation: _generation,
+          invocation: "ComicSource.sources.$key.settings",
+        ),
+      );
       if (value is Map) {
         var newMap = <String, Map<String, dynamic>>{};
         for (var e in value.entries) {
@@ -277,7 +348,10 @@ class ComicSource {
             }
             var v2 = e2.value;
             if (v2 is JSInvokable) {
-              v2 = JSAutoFreeFunction(v2);
+              v2 = JSAutoFreeFunction(
+                v2,
+                isActive: () => findGeneration(key, _generation) == this,
+              );
             }
             v[e2.key] = v2;
           }
@@ -325,8 +399,9 @@ class ComicSource {
     this.enableTagsSuggestions,
     this.enableTagsTranslate,
     this.starRatingFunc,
-    this.archiveDownloader,
-  );
+    this.archiveDownloader, {
+    String? generation,
+  }) : _generation = generation ?? const Uuid().v4();
 }
 
 class AccountConfig {

@@ -21,8 +21,31 @@ The repo is maintained by the Venera team.
 
 > The link is a mirror of the original repo. To contribute your comic source, please visit the [original repo](https://github.com/venera-app/venera-configs)
 
-You should provide a repository url to let the app load the comic source list.
-The url should point to a JSON file that contains the list of comic sources.
+Venera Community supports multiple saved repositories directly in **Comic
+Sources > Comic Source list**. Use the **Repository URL** card at the top of
+that page to select a saved address, add or edit an address, save it, refresh
+the selected repository, or delete it. The source list below the card always
+shows the currently selected repository. All enabled repositories are still
+used for background update checks, and a failure in one repository does not
+prevent the other repositories from being checked.
+
+If two repositories publish the same source `key`, Venera does not silently
+overwrite the installed source. The list identifies the installed origin and
+offers an explicit, confirmed **Switch** action for another repository entry.
+Updates remain bound to the selected repository and resolved script URL. A
+cross-repository switch clears the old source's saved account, password, and
+private source data before the new JavaScript is loaded; this prevents a newly
+trusted publisher from inheriting credentials that belonged to another source.
+
+A repository URL must be a public HTTPS URL without embedded credentials or
+sensitive query parameters. The URL should point to a UTF-8 JSON file that
+contains the list of comic sources. Relative source paths are resolved against
+the final repository URL after HTTPS redirects.
+
+Comic source files are executable JavaScript, not passive configuration. The
+app shows the repository and download host and asks the user to confirm the
+risk before installing a source from a repository. Repository owners should
+therefore keep their publishing account and hosting pipeline secure.
 
 The JSON file should have the following format:
 
@@ -30,16 +53,25 @@ The JSON file should have the following format:
 [
   {
     "name": "Source Name",
+    "key": "source_key",
     "url": "https://example.com/source.js",
-    "filename": "Relative path to the source file",
     "version": "1.0.0",
     "description": "A brief description of the source"
+  },
+  {
+    "name": "Source With Relative File",
+    "key": "another_source",
+    "fileName": "sources/another_source.js",
+    "version": "1.0.0"
   }
 ]
 ```
 
-Only one of `url` and `filename` should be provided.
-The description field is optional.
+Each entry must provide `name`, `key`, and a valid semantic `version`. Exactly
+one of `url` and `fileName` should be provided. The legacy spelling `filename`
+is accepted for compatibility, but `fileName` is canonical. The `description`
+field is optional. Invalid entries are isolated and reported without hiding
+valid entries or other repositories.
 
 ## Create a Comic Source
 

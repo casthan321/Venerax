@@ -4,7 +4,7 @@ import 'dart:math' as math;
 import 'package:crypto/crypto.dart';
 import 'package:dio/io.dart';
 import 'package:enough_convert/enough_convert.dart';
-import 'package:flutter/foundation.dart' show protected;
+import 'package:flutter/foundation.dart' show protected, visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:html/parser.dart' as html;
 import 'package:html/dom.dart' as dom;
@@ -44,6 +44,13 @@ class JavaScriptRuntimeException implements Exception {
   String toString() {
     return "JSException: $message";
   }
+}
+
+class ComicSourceGenerationExpiredException implements Exception {
+  const ComicSourceGenerationExpiredException();
+
+  @override
+  String toString() => "Comic source callback is no longer active";
 }
 
 class JsEngine with _JSEngineApi, JsUiApi, Init {
@@ -135,6 +142,20 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
     }
   }
 
+  ComicSource _activeComicSourceForMessage(Map<dynamic, dynamic> message) {
+    final key = message["key"];
+    final generation = message["generation"];
+    if (key is! String || generation is! String) {
+      throw StateError("Comic source generation is missing");
+    }
+    return ComicSource.requireGeneration(key, generation);
+  }
+
+  @visibleForTesting
+  Object? receiveComicSourceMessageForTesting(Map<String, dynamic> message) {
+    return _messageReceiver(message);
+  }
+
   Object? _messageReceiver(dynamic message) {
     var operation = 'unknown operation';
     try {
@@ -156,25 +177,22 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
               summarizeNetworkPayload(message["content"]),
             );
           case 'load_data':
-            String key = message["key"];
             String dataKey = message["data_key"];
-            return ComicSource.find(key)?.data[dataKey];
+            return _activeComicSourceForMessage(message).data[dataKey];
           case 'save_data':
-            String key = message["key"];
             String dataKey = message["data_key"];
             if (dataKey == 'setting') {
               throw "setting is not allowed to be saved";
             }
             var data = message["data"];
-            var source = ComicSource.find(key)!;
+            var source = _activeComicSourceForMessage(message);
             source.data[dataKey] = data;
-            source.saveData();
+            return source.saveData();
           case 'delete_data':
-            String key = message["key"];
             String dataKey = message["data_key"];
-            var source = ComicSource.find(key);
-            source?.data.remove(dataKey);
-            source?.saveData();
+            var source = _activeComicSourceForMessage(message);
+            source.data.remove(dataKey);
+            return source.saveData();
           case 'http':
             return _http(Map.from(message));
           case 'html':
@@ -192,14 +210,13 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
           case "uuid":
             return const Uuid().v1();
           case "load_setting":
-            String key = message["key"];
             String settingKey = message["setting_key"];
-            var source = ComicSource.find(key)!;
+            var source = _activeComicSourceForMessage(message);
             return source.data["settings"]?[settingKey] ??
                 source.settings?[settingKey]!['default'] ??
                 (throw "Setting not found: $settingKey");
           case "isLogged":
-            return ComicSource.find(message["key"])!.isLogged;
+            return _activeComicSourceForMessage(message).isLogged;
           // temporary solution for [setTimeout] function
           // TODO: implement [setTimeout] in quickjs project
           case "delay":
@@ -235,7 +252,9 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
       }
       return null;
     } catch (e, s) {
-      Log.error('JS Engine', 'Failed to handle $operation: $e', s);
+      if (e is! ComicSourceGenerationExpiredException) {
+        Log.error('JS Engine', 'Failed to handle $operation: $e', s);
+      }
       rethrow;
     }
   }
@@ -753,13 +772,18 @@ class DocumentWrapper {
 class JSAutoFreeFunction {
   final JSInvokable func;
 
+  final bool Function()? isActive;
+
   /// Automatically free the function when it's not used anymore
-  JSAutoFreeFunction(this.func) {
+  JSAutoFreeFunction(this.func, {this.isActive}) {
     func.dup();
     finalizer.attach(this, func);
   }
 
   dynamic call(List<dynamic> args) {
+    if (isActive?.call() == false) {
+      throw const ComicSourceGenerationExpiredException();
+    }
     return func(args);
   }
 

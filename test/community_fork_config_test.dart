@@ -85,15 +85,15 @@ void main() {
     expect(projectLinks, everyElement(isNot(contains(previousRepository))));
   });
 
-  test('Stable version metadata and release notes stay in sync', () {
+  test('Release version metadata and release notes stay in sync', () {
     final pubspec =
         loadYaml(File('pubspec.yaml').readAsStringSync()) as YamlMap;
     final fullVersion = pubspec['version'] as String;
     final versionName = fullVersion.split('+').first;
     final appSource = File('lib/foundation/app.dart').readAsStringSync();
 
-    expect(fullVersion, '1.7.0+171');
-    expect(versionName, '1.7.0');
+    expect(fullVersion, '1.8.0-beta.1+180');
+    expect(versionName, '1.8.0-beta.1');
     expect(appSource, contains('final version = "$versionName"'));
     expect(File('doc/releases/v$versionName.md').lengthSync(), greaterThan(0));
   });

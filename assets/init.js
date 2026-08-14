@@ -1149,6 +1149,7 @@ class ComicSource {
         return sendMessage({
             method: 'load_data',
             key: this.key,
+            generation: this.__veneraGeneration,
             data_key: dataKey
         })
     }
@@ -1162,6 +1163,7 @@ class ComicSource {
         return sendMessage({
             method: 'load_setting',
             key: this.key,
+            generation: this.__veneraGeneration,
             setting_key: key
         })
     }
@@ -1175,6 +1177,7 @@ class ComicSource {
         return sendMessage({
             method: 'save_data',
             key: this.key,
+            generation: this.__veneraGeneration,
             data_key: dataKey,
             data: data
         })
@@ -1188,6 +1191,7 @@ class ComicSource {
         return sendMessage({
             method: 'delete_data',
             key: this.key,
+            generation: this.__veneraGeneration,
             data_key: dataKey,
         })
     }
@@ -1200,6 +1204,7 @@ class ComicSource {
         return sendMessage({
             method: 'isLogged',
             key: this.key,
+            generation: this.__veneraGeneration,
         });
     }
 

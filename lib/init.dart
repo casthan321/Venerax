@@ -15,6 +15,7 @@ import 'package:venera/pages/comic_source_page.dart';
 import 'package:venera/pages/follow_updates_page.dart';
 import 'package:venera/pages/settings/settings_page.dart';
 import 'package:venera/utils/app_links.dart';
+import 'package:venera/utils/comic_source_install_transaction.dart';
 import 'package:venera/utils/handle_text_share.dart';
 import 'package:venera/utils/import_transaction.dart';
 import 'package:venera/utils/opencc.dart';
@@ -45,6 +46,7 @@ Future<void> init() async {
     journalFile: appDataImportJournalFile(App.dataPath),
     allowedDestinationRoot: App.dataPath,
   );
+  await recoverInterruptedComicSourceInstall(App.dataPath);
   await recoverInterruptedLocalPathMigration(App.dataPath);
   await SingleInstanceCookieJar.createInstance();
   try {
@@ -97,15 +99,6 @@ void _checkOldConfigs() {
     }
     appdata.writeImplicitData();
   }
-
-  if (appdata.settings['comicSourceListUrl'].toString().contains(
-    "git.nyne.dev",
-  )) {
-    // migrate to jsdelivr cdn
-    appdata.settings['comicSourceListUrl'] =
-        "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
-    appdata.saveData();
-  }
 }
 
 Future<void> _checkAppUpdates() async {
@@ -114,15 +107,21 @@ Future<void> _checkAppUpdates() async {
   if (now - lastCheck < 24 * 60 * 60 * 1000) {
     return;
   }
-  appdata.implicitData['lastCheckUpdate'] = now;
-  appdata.writeImplicitData();
-  ComicSourcePage.checkComicSourceUpdate();
-  if (appdata.settings['checkUpdateOnStart']) {
-    await checkUpdateUi(false, true);
+  try {
+    final sourceCheck = await ComicSourcePage.checkComicSourceUpdate();
+    if (appdata.settings['checkUpdateOnStart']) {
+      await checkUpdateUi(false, true);
+    }
+    if (sourceCheck >= 0) {
+      appdata.implicitData['lastCheckUpdate'] = now;
+      await appdata.writeImplicitData();
+    }
+  } catch (error, stackTrace) {
+    Log.error('Update check', '$error\n$stackTrace');
   }
 }
 
 void checkUpdates() {
-  _checkAppUpdates();
+  unawaited(_checkAppUpdates());
   FollowUpdatesService.initChecker();
 }
