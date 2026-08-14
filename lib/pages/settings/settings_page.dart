@@ -19,6 +19,7 @@ import 'package:venera/utils/data.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/translations.dart';
+import 'package:venera/utils/version_comparison.dart';
 import 'package:yaml/yaml.dart';
 
 part 'reader.dart';
@@ -73,6 +74,17 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     currentPage = widget.initialPage;
     super.initState();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // A two-pane layout should never open with an empty detail pane. This also
+    // handles a live resize from the compact layout to a desktop-sized window.
+    if (enableTwoViews &&
+        (currentPage < 0 || currentPage >= categories.length)) {
+      currentPage = 0;
+    }
   }
 
   @override
@@ -147,7 +159,7 @@ class _SettingsPageState extends State<SettingsPage> {
               children: [
                 const SizedBox(width: 8),
                 Tooltip(
-                  message: "Back",
+                  message: "Back".tl,
                   child: IconButton(
                     icon: const Icon(Icons.arrow_back),
                     onPressed: context.pop,
@@ -188,8 +200,14 @@ class _SettingsPageState extends State<SettingsPage> {
           children: [
             Icon(icons[id]),
             const SizedBox(width: 16),
-            Text(name, style: ts.s16),
-            const Spacer(),
+            Expanded(
+              child: Text(
+                name,
+                style: ts.s16,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             if (selected) const Icon(Icons.arrow_right),
           ],
         ),
@@ -220,10 +238,11 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Widget buildRight() {
-    if (currentPage == -1) {
+    if (currentPage < 0 || currentPage >= categories.length) {
       return const SizedBox();
     }
     return Navigator(
+      key: ValueKey('settings-detail-$currentPage'),
       onGenerateRoute: (settings) {
         return PageRouteBuilder(
           pageBuilder: (context, animation, secondaryAnimation) {

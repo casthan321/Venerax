@@ -26,6 +26,7 @@ abstract class ImageDownloader {
         totalBytes: data.length,
         imageBytes: data,
       );
+      return;
     }
 
     var configs = <String, dynamic>{};
@@ -70,28 +71,37 @@ abstract class ImageDownloader {
     if (expectedBytes == -1) {
       expectedBytes = null;
     }
-    var buffer = <int>[];
+    final buffer = BytesBuilder(copy: false);
+    var receivedBytes = 0;
     await for (var data in stream) {
-      buffer.addAll(data);
+      buffer.add(data);
+      receivedBytes += data.length;
       if (expectedBytes != null) {
         yield ImageDownloadProgress(
-          currentBytes: buffer.length,
+          currentBytes: receivedBytes,
           totalBytes: expectedBytes,
         );
       }
     }
 
+    Uint8List bytes = buffer.takeBytes();
+
     if (configs['onResponse'] is JSInvokable) {
-      final uint8List = Uint8List.fromList(buffer);
-      buffer = (configs['onResponse'] as JSInvokable)([uint8List]);
+      final transformed = (configs['onResponse'] as JSInvokable)([bytes]);
       (configs['onResponse'] as JSInvokable).free();
+      if (transformed is! List<int>) {
+        throw 'Error: Invalid onResponse result.';
+      }
+      bytes = transformed is Uint8List
+          ? transformed
+          : Uint8List.fromList(transformed);
     }
 
-    await CacheManager().writeCache(cacheKey, buffer);
+    await CacheManager().writeCache(cacheKey, bytes);
     yield ImageDownloadProgress(
-      currentBytes: buffer.length,
-      totalBytes: buffer.length,
-      imageBytes: Uint8List.fromList(buffer),
+      currentBytes: bytes.length,
+      totalBytes: bytes.length,
+      imageBytes: bytes,
     );
   }
 

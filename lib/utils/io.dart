@@ -56,6 +56,52 @@ class FilePath {
         p.posix.isWithin(normalizedParent, normalizedCandidate);
   }
 
+  /// Re-roots [candidate] from [oldRoot] to [newRoot].
+  ///
+  /// Returns `null` when [candidate] is outside [oldRoot]. SAF document paths
+  /// and normal `/storage/...` paths are compared through the same canonical
+  /// storage representation, while the returned value preserves the selected
+  /// representation of [newRoot].
+  static String? rebaseWithin(
+    String oldRoot,
+    String newRoot,
+    String candidate,
+  ) {
+    final usesAndroidDocumentPath =
+        oldRoot.startsWith('android://') ||
+        newRoot.startsWith('android://') ||
+        candidate.startsWith('android://');
+    if (!usesAndroidDocumentPath) {
+      final context =
+          _usesWindowsPathSyntax(oldRoot) ||
+              _usesWindowsPathSyntax(newRoot) ||
+              _usesWindowsPathSyntax(candidate)
+          ? p.windows
+          : p.posix;
+      if (!context.equals(oldRoot, candidate) &&
+          !context.isWithin(oldRoot, candidate)) {
+        return null;
+      }
+      final relative = context.relative(candidate, from: oldRoot);
+      return relative == '.'
+          ? context.normalize(newRoot)
+          : context.join(newRoot, relative);
+    }
+
+    final normalizedOld = _androidDocumentPathToStoragePath(oldRoot);
+    final normalizedCandidate = _androidDocumentPathToStoragePath(candidate);
+    if (!p.posix.equals(normalizedOld, normalizedCandidate) &&
+        !p.posix.isWithin(normalizedOld, normalizedCandidate)) {
+      return null;
+    }
+    final relative = p.posix.relative(normalizedCandidate, from: normalizedOld);
+    if (relative == '.') return newRoot;
+    if (newRoot.startsWith('android://')) {
+      return '${newRoot.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '')}/$relative';
+    }
+    return p.joinAll([newRoot, ...p.posix.split(relative)]);
+  }
+
   static String _androidDocumentPathToStoragePath(String path) {
     var normalized = path.replaceAll('\\', '/');
     if (!normalized.startsWith('android://')) {
@@ -75,6 +121,9 @@ class FilePath {
         : '/storage/$volume';
     return p.posix.normalize(p.posix.join(storageRoot, relativePath));
   }
+
+  static bool _usesWindowsPathSyntax(String path) =>
+      path.contains('\\') || RegExp(r'^[A-Za-z]:[/\\]').hasMatch(path);
 }
 
 const supportedComicImageExtensions = <String>{

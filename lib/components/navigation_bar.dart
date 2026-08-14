@@ -196,18 +196,21 @@ class NaviPaneState extends State<NaviPane>
           final value = controller.value;
           Widget content = Stack(
             children: [
-              Positioned(
-                left: _kFoldedSideBarWidth * ((value - 2.0).clamp(-1.0, 0.0)),
-                top: 0,
-                bottom: 0,
-                child: buildLeft(),
-              ),
               Positioned.fill(
                 left:
                     _kFoldedSideBarWidth * ((value - 1).clamp(0, 1)) +
                     (_kSideBarWidth - _kFoldedSideBarWidth) *
                         ((value - 2).clamp(0, 1)),
                 child: buildMainView(),
+              ),
+              // Keep the navigation rail after the nested Navigator in the
+              // semantics and paint order. A route-scoped semantics node can
+              // otherwise hide preceding siblings from assistive technology.
+              Positioned(
+                left: _kFoldedSideBarWidth * ((value - 2.0).clamp(-1.0, 0.0)),
+                top: 0,
+                bottom: 0,
+                child: buildLeft(),
               ),
             ],
           );
@@ -392,22 +395,41 @@ class _SideNaviWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final icon = Icon(enabled ? entry.activeIcon : entry.icon);
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
+    return Semantics(
+      key: ValueKey('side-navigation-${entry.label}'),
+      identifier: 'side-navigation-${entry.label}',
+      container: true,
+      button: true,
+      selected: enabled,
+      label: entry.label,
       onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        height: 38,
-        decoration: BoxDecoration(
-          color: enabled ? colorScheme.primaryContainer : null,
-          borderRadius: BorderRadius.circular(12),
+      child: Tooltip(
+        message: entry.label,
+        excludeFromSemantics: true,
+        child: ExcludeSemantics(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: onTap,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              height: 38,
+              decoration: BoxDecoration(
+                color: enabled ? colorScheme.primaryContainer : null,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: showTitle
+                  ? Row(
+                      children: [
+                        icon,
+                        const SizedBox(width: 12),
+                        Text(entry.label),
+                      ],
+                    )
+                  : Align(alignment: Alignment.centerLeft, child: icon),
+            ),
+          ),
         ),
-        child: showTitle
-            ? Row(
-                children: [icon, const SizedBox(width: 12), Text(entry.label)],
-              )
-            : Align(alignment: Alignment.centerLeft, child: icon),
       ),
     ).paddingVertical(4);
   }
@@ -427,18 +449,36 @@ class _PaneActionWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final icon = Icon(entry.icon);
-    return InkWell(
+    return Semantics(
+      key: ValueKey('pane-action-${entry.label}'),
+      identifier: 'pane-action-${entry.label}',
+      container: true,
+      button: true,
+      label: entry.label,
       onTap: entry.onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        height: 38,
-        child: showTitle
-            ? Row(
-                children: [icon, const SizedBox(width: 12), Text(entry.label)],
-              )
-            : Align(alignment: Alignment.centerLeft, child: icon),
+      child: Tooltip(
+        message: entry.label,
+        excludeFromSemantics: true,
+        child: ExcludeSemantics(
+          child: InkWell(
+            onTap: entry.onTap,
+            borderRadius: BorderRadius.circular(12),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              height: 38,
+              child: showTitle
+                  ? Row(
+                      children: [
+                        icon,
+                        const SizedBox(width: 12),
+                        Text(entry.label),
+                      ],
+                    )
+                  : Align(alignment: Alignment.centerLeft, child: icon),
+            ),
+          ),
+        ),
       ),
     ).paddingVertical(4);
   }
@@ -499,20 +539,35 @@ class _SingleBottomNaviWidgetState extends State<_SingleBottomNaviWidget>
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: CurvedAnimation(parent: controller, curve: Curves.ease),
-      builder: (context, child) {
-        return MouseRegion(
-          cursor: SystemMouseCursors.click,
-          onEnter: (details) => setState(() => isHovering = true),
-          onExit: (details) => setState(() => isHovering = false),
-          child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onTap: widget.onTap,
-            child: buildContent(),
+    return Semantics(
+      key: ValueKey('bottom-navigation-${widget.entry.label}'),
+      identifier: 'bottom-navigation-${widget.entry.label}',
+      container: true,
+      button: true,
+      selected: widget.enabled,
+      label: widget.entry.label,
+      onTap: widget.onTap,
+      child: Tooltip(
+        message: widget.entry.label,
+        excludeFromSemantics: true,
+        child: ExcludeSemantics(
+          child: AnimatedBuilder(
+            animation: CurvedAnimation(parent: controller, curve: Curves.ease),
+            builder: (context, child) {
+              return MouseRegion(
+                cursor: SystemMouseCursors.click,
+                onEnter: (details) => setState(() => isHovering = true),
+                onExit: (details) => setState(() => isHovering = false),
+                child: GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTap: widget.onTap,
+                  child: buildContent(),
+                ),
+              );
+            },
           ),
-        );
-      },
+        ),
+      ),
     );
   }
 

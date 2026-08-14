@@ -1,6 +1,9 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:path_provider/path_provider.dart';
@@ -12,10 +15,326 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/pages/reader/reader.dart';
 import 'package:venera/utils/async_retry.dart';
+import 'package:venera/utils/atomic_file.dart';
+import 'package:venera/utils/coalescing_async_writer.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/maintenance_coordinator.dart';
 
 import 'app.dart';
 import 'history.dart';
+
+/// Adds indexes for the local-library queries run by the home and library
+/// pages. Local entries are relatively cheap to update, while these ordered
+/// reads happen on every listener-driven rebuild.
+@visibleForTesting
+void ensureLocalLibraryPerformanceIndexes(Database database) {
+  database.execute('''
+    CREATE INDEX IF NOT EXISTS local_comics_created_at_index
+    ON comics(created_at DESC);
+  ''');
+  database.execute('''
+    CREATE INDEX IF NOT EXISTS local_comics_title_index
+    ON comics(title);
+  ''');
+  database.execute('''
+    CREATE INDEX IF NOT EXISTS local_comics_directory_index
+    ON comics(directory);
+  ''');
+}
+
+@visibleForTesting
+final class DownloadQueueRestoreFailure {
+  const DownloadQueueRestoreFailure(this.index, this.error, this.stackTrace);
+
+  final int index;
+  final Object error;
+  final StackTrace stackTrace;
+}
+
+@visibleForTesting
+final class DownloadQueueRestoreResult<T> {
+  const DownloadQueueRestoreResult._({
+    required this.tasks,
+    required this.failures,
+    this.documentError,
+    this.documentStackTrace,
+  });
+
+  final List<T> tasks;
+  final List<DownloadQueueRestoreFailure> failures;
+  final Object? documentError;
+  final StackTrace? documentStackTrace;
+
+  bool get requiresFileQuarantine => documentError != null;
+}
+
+/// Decodes one persisted queue snapshot without letting a malformed task hide
+/// valid tasks that follow it. A document-level error is kept separate so the
+/// caller can quarantine the original snapshot instead of deleting it.
+@visibleForTesting
+DownloadQueueRestoreResult<T> decodeDownloadingTaskQueue<T>(
+  String contents,
+  T? Function(Map<String, dynamic> json) decodeTask,
+) {
+  late final Object? decoded;
+  try {
+    decoded = jsonDecode(contents);
+  } catch (error, stackTrace) {
+    return DownloadQueueRestoreResult<T>._(
+      tasks: const [],
+      failures: const [],
+      documentError: error,
+      documentStackTrace: stackTrace,
+    );
+  }
+
+  if (decoded is! List<dynamic>) {
+    return DownloadQueueRestoreResult<T>._(
+      tasks: const [],
+      failures: const [],
+      documentError: const FormatException(
+        'Downloading task queue must be a JSON array.',
+      ),
+      documentStackTrace: StackTrace.current,
+    );
+  }
+
+  final tasks = <T>[];
+  final failures = <DownloadQueueRestoreFailure>[];
+  for (var index = 0; index < decoded.length; index++) {
+    try {
+      final entry = decoded[index];
+      if (entry is! Map<String, dynamic>) {
+        throw const FormatException('Downloading task must be a JSON object.');
+      }
+      final task = decodeTask(Map<String, dynamic>.from(entry));
+      if (task == null) {
+        throw const FormatException('Unsupported downloading task type.');
+      }
+      tasks.add(task);
+    } catch (error, stackTrace) {
+      failures.add(DownloadQueueRestoreFailure(index, error, stackTrace));
+    }
+  }
+
+  return DownloadQueueRestoreResult<T>._(
+    tasks: List<T>.unmodifiable(tasks),
+    failures: List<DownloadQueueRestoreFailure>.unmodifiable(failures),
+  );
+}
+
+const localPathMigrationJournalFileName = '.venera-local-path-migration.json';
+
+File localPathMigrationJournalFile(String dataPath) =>
+    File(FilePath.join(dataPath, localPathMigrationJournalFileName));
+
+enum _LocalPathMigrationPhase {
+  copying,
+  copied,
+  committing,
+  pathCommitted,
+  rollingBack,
+}
+
+final class _LocalPathMigrationJournal {
+  _LocalPathMigrationJournal._(
+    this.file,
+    this.oldPath,
+    this.newPath,
+    this.operationId,
+  );
+
+  static const version = 1;
+
+  final File file;
+  final String oldPath;
+  final String newPath;
+  final String operationId;
+
+  static Future<_LocalPathMigrationJournal> begin({
+    required String dataPath,
+    required String oldPath,
+    required String newPath,
+  }) async {
+    final file = localPathMigrationJournalFile(dataPath);
+    if (await file.exists()) {
+      throw StateError(
+        'An unfinished storage migration must be recovered first',
+      );
+    }
+    final journal = _LocalPathMigrationJournal._(
+      file,
+      oldPath,
+      newPath,
+      '${DateTime.now().microsecondsSinceEpoch}-${Object().hashCode}',
+    );
+    await journal.writePhase(_LocalPathMigrationPhase.copying);
+    return journal;
+  }
+
+  Future<void> writePhase(_LocalPathMigrationPhase phase) {
+    return writeStringAtomically(
+      file,
+      jsonEncode({
+        'version': version,
+        'operationId': operationId,
+        'phase': phase.name,
+        'oldPath': oldPath,
+        'newPath': newPath,
+      }),
+    );
+  }
+
+  Future<void> finish() async {
+    if (await file.exists()) await file.delete();
+  }
+}
+
+/// Reconciles a storage-root migration before LocalManager opens local.db or
+/// restores the downloading queue.
+///
+/// `local_path` is the commit record: a crash before it changes rolls all
+/// persisted paths back to [oldPath], while a crash after it changes completes
+/// rebasing to [newPath]. Both physical roots are deliberately retained during
+/// startup recovery; deleting a user-visible directory is never required to
+/// make metadata consistent again.
+Future<void> recoverInterruptedLocalPathMigration(String dataPath) async {
+  final journalFile = localPathMigrationJournalFile(dataPath);
+  if (!await journalFile.exists()) return;
+  final decoded = jsonDecode(await journalFile.readAsString());
+  if (decoded is! Map<String, dynamic> ||
+      decoded['version'] != _LocalPathMigrationJournal.version ||
+      decoded['operationId'] is! String ||
+      !(RegExp(
+        r'^[A-Za-z0-9._-]+$',
+      ).hasMatch(decoded['operationId'] as String)) ||
+      decoded['phase'] is! String ||
+      decoded['oldPath'] is! String ||
+      decoded['newPath'] is! String) {
+    throw const FormatException('Invalid local path migration journal');
+  }
+  final oldPath = decoded['oldPath'] as String;
+  final newPath = decoded['newPath'] as String;
+  if (oldPath.isEmpty ||
+      newPath.isEmpty ||
+      FilePath.isSameOrWithin(oldPath, newPath) ||
+      FilePath.isSameOrWithin(newPath, oldPath)) {
+    throw const FormatException('Unsafe local path migration journal');
+  }
+  final phase = _LocalPathMigrationPhase.values.firstWhere(
+    (value) => value.name == decoded['phase'],
+    orElse: () =>
+        throw const FormatException('Unknown local path migration phase'),
+  );
+  final configuredPathFile = File(FilePath.join(dataPath, 'local_path'));
+  var configuredPath = '';
+  if (await configuredPathFile.exists()) {
+    configuredPath = await configuredPathFile.readAsString();
+  }
+  final completeNewPath =
+      phase == _LocalPathMigrationPhase.pathCommitted ||
+      (phase == _LocalPathMigrationPhase.committing &&
+          configuredPath == newPath);
+  final targetPath = completeNewPath ? newPath : oldPath;
+  final sourcePath = completeNewPath ? oldPath : newPath;
+  if (!await Directory(targetPath).exists()) {
+    throw FileSystemException(
+      'Storage migration recovery target is unavailable',
+      targetPath,
+    );
+  }
+
+  _rebaseLocalComicDatabase(
+    File(FilePath.join(dataPath, 'local.db')),
+    sourcePath,
+    targetPath,
+  );
+  await _rebasePersistedDownloadingTasks(
+    File(FilePath.join(dataPath, 'downloading_tasks.json')),
+    sourcePath,
+    targetPath,
+  );
+  await writeStringAtomically(configuredPathFile, targetPath);
+  await journalFile.delete();
+}
+
+void _rebaseLocalComicDatabase(
+  File databaseFile,
+  String sourcePath,
+  String targetPath,
+) {
+  if (!databaseFile.existsSync()) return;
+  final database = sqlite3.open(databaseFile.path);
+  try {
+    final hasComicsTable = database
+        .select(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'comics';",
+        )
+        .isNotEmpty;
+    if (!hasComicsTable) return;
+    database.execute('BEGIN IMMEDIATE;');
+    try {
+      final rows = database.select(
+        'SELECT id, comic_type, directory FROM comics;',
+      );
+      for (final row in rows) {
+        final directory = row[2] as String;
+        final rebased = FilePath.rebaseWithin(
+          sourcePath,
+          targetPath,
+          directory,
+        );
+        if (rebased == null || rebased == directory) continue;
+        database.execute(
+          'UPDATE comics SET directory = ? '
+          'WHERE id = ? AND comic_type = ?;',
+          [rebased, row[0], row[1]],
+        );
+      }
+      database.execute('COMMIT;');
+    } catch (_) {
+      database.execute('ROLLBACK;');
+      rethrow;
+    }
+  } finally {
+    database.dispose();
+  }
+}
+
+Future<void> _rebasePersistedDownloadingTasks(
+  File queueFile,
+  String sourcePath,
+  String targetPath,
+) async {
+  if (!await queueFile.exists()) return;
+  final decoded = jsonDecode(await queueFile.readAsString());
+  if (decoded is! List) {
+    throw const FormatException('Downloading task queue must be a JSON array');
+  }
+  var changed = false;
+  for (final value in decoded) {
+    if (value is! Map || value['path'] is! String) continue;
+    final currentPath = value['path'] as String;
+    final rebased = FilePath.rebaseWithin(sourcePath, targetPath, currentPath);
+    if (rebased == null || rebased == currentPath) continue;
+    value['path'] = rebased;
+    changed = true;
+  }
+  if (changed) {
+    await writeStringAtomically(queueFile, jsonEncode(decoded));
+  }
+}
+
+File _quarantineInvalidDownloadQueue(File file) {
+  final suffix = DateTime.now().toUtc().millisecondsSinceEpoch;
+  var candidate = File('${file.path}.corrupt-$suffix');
+  var collision = 1;
+  while (candidate.existsSync()) {
+    candidate = File('${file.path}.corrupt-$suffix-$collision');
+    collision++;
+  }
+  return file.renameSync(candidate.path);
+}
 
 final class LocalComicDirectoryMissingException implements Exception {
   const LocalComicDirectoryMissingException(this.path);
@@ -247,12 +566,31 @@ class LocalManager with ChangeNotifier {
 
   late Database _db;
 
+  late final CoalescingAsyncWriter<String> _downloadingTaskWriter =
+      CoalescingAsyncWriter<String>((contents) {
+        return writeStringAtomically(
+          File(FilePath.join(App.dataPath, 'downloading_tasks.json')),
+          contents,
+        );
+      });
+
   /// path to the directory where all the comics are stored
   late String path;
 
   Directory get directory => Directory(path);
 
   bool _isChangingPath = false;
+
+  bool _downloadQueueResumeDeferred = false;
+
+  void _resumeDownloadQueueOrDefer() {
+    if (downloadingTasks.isEmpty) return;
+    if (_isChangingPath) {
+      _downloadQueueResumeDeferred = true;
+      return;
+    }
+    downloadingTasks.first.resume();
+  }
 
   void _checkNoMedia() {
     if (App.isAndroid) {
@@ -264,7 +602,18 @@ class LocalManager with ChangeNotifier {
   }
 
   // return error message if failed
-  Future<String?> setNewPath(String newPath) async {
+  Future<String?> setNewPath(String newPath) {
+    if (_isChangingPath) {
+      return Future.value('Storage path migration is already in progress');
+    }
+    final maintenance = MaintenanceCoordinator.instance;
+    if (maintenance.isActive) {
+      return Future.value('Another data maintenance operation is in progress');
+    }
+    return maintenance.run('Move Local Comics', () => _setNewPath(newPath));
+  }
+
+  Future<String?> _setNewPath(String newPath) async {
     if (_isChangingPath) return "Storage path migration is already in progress";
     _isChangingPath = true;
     try {
@@ -278,21 +627,264 @@ class LocalManager with ChangeNotifier {
       if (!await newDir.list().isEmpty) {
         return "Directory is not empty";
       }
+
+      final oldPath = path;
+      final oldDirectory = directory;
+      final taskSnapshot = List<DownloadTask>.of(downloadingTasks);
+      final queueWasRunning = taskSnapshot.firstOrNull?.isPaused == false;
+      final previousTaskPaths = HashMap<DownloadTask, String?>.identity();
+      final previousComicDirectories =
+          <({String id, int comicType, String directory})>[];
+      final configuredPathFile = File(
+        FilePath.join(App.dataPath, 'local_path'),
+      );
+
+      void resumeQueueIfNeeded() {
+        if (queueWasRunning) _resumeDownloadQueueOrDefer();
+      }
+
       try {
-        await copyDirectoryIsolate(directory, newDir);
-        await File(
-          FilePath.join(App.dataPath, 'local_path'),
-        ).writeAsString(newPath);
+        await Future.wait(taskSnapshot.map((task) => task.pauseAndWait()));
       } catch (e, s) {
-        Log.error("IO", e, s);
+        Log.error('IO', 'Failed to pause downloads for migration: $e', s);
+        resumeQueueIfNeeded();
         return e.toString();
       }
-      await directory.deleteContents(recursive: true);
+
+      late final _LocalPathMigrationJournal migrationJournal;
+      try {
+        migrationJournal = await _LocalPathMigrationJournal.begin(
+          dataPath: App.dataPath,
+          oldPath: oldPath,
+          newPath: newPath,
+        );
+      } catch (e, s) {
+        Log.error(
+          'IO',
+          'Failed to start the storage path migration journal: $e',
+          s,
+        );
+        resumeQueueIfNeeded();
+        return e.toString();
+      }
+
+      try {
+        await copyDirectoryIsolate(oldDirectory, newDir);
+        await migrationJournal.writePhase(_LocalPathMigrationPhase.copied);
+      } catch (e, s) {
+        Log.error("IO", e, s);
+        await newDir.deleteContents(recursive: true).catchError((_) {});
+        try {
+          await migrationJournal.finish();
+        } catch (journalError, journalStackTrace) {
+          Log.error(
+            'IO',
+            'Failed to clear the aborted storage migration journal: '
+                '$journalError',
+            journalStackTrace,
+          );
+        }
+        resumeQueueIfNeeded();
+        return e.toString();
+      }
+
+      try {
+        await migrationJournal.writePhase(_LocalPathMigrationPhase.committing);
+        for (final task in downloadingTasks) {
+          final taskPath = task.path;
+          if (taskPath == null) continue;
+          final rebased = FilePath.rebaseWithin(oldPath, newPath, taskPath);
+          if (rebased != null && rebased != taskPath) {
+            previousTaskPaths[task] = taskPath;
+            task.path = rebased;
+          }
+        }
+        final comicRows = _db.select(
+          'SELECT id, comic_type, directory FROM comics;',
+        );
+        for (final row in comicRows) {
+          final id = row[0] as String;
+          final comicType = row[1] as int;
+          final comicDirectory = row[2] as String;
+          final rebased = FilePath.rebaseWithin(
+            oldPath,
+            newPath,
+            comicDirectory,
+          );
+          if (rebased == null || rebased == comicDirectory) continue;
+          previousComicDirectories.add((
+            id: id,
+            comicType: comicType,
+            directory: comicDirectory,
+          ));
+          _db.execute(
+            'UPDATE comics SET directory = ? '
+            'WHERE id = ? AND comic_type = ?;',
+            [rebased, id, comicType],
+          );
+        }
+        await saveCurrentDownloadingTasks();
+        await writeStringAtomically(configuredPathFile, newPath);
+      } catch (e, s) {
+        Log.error('IO', 'Failed to commit storage path migration: $e', s);
+        var configuredPathIsNew = false;
+        try {
+          configuredPathIsNew =
+              await configuredPathFile.exists() &&
+              await configuredPathFile.readAsString() == newPath;
+        } catch (readError, readStackTrace) {
+          Log.error(
+            'IO',
+            'Failed to read the storage path commit record: $readError',
+            readStackTrace,
+          );
+        }
+        if (configuredPathIsNew) {
+          // The path file is the durable commit record. An atomic path write
+          // may report a late cleanup error after the rename itself already
+          // succeeded; rolling back from that state could make crash recovery
+          // choose the opposite direction.
+          Log.error(
+            'IO',
+            'The storage path commit record is already durable; completing '
+                'the migration despite the late error.',
+          );
+        } else {
+          try {
+            await migrationJournal.writePhase(
+              _LocalPathMigrationPhase.rollingBack,
+            );
+          } catch (journalError, journalStackTrace) {
+            // With local_path still pointing at the old root, every earlier
+            // journal phase also selects rollback during startup recovery.
+            Log.error(
+              'IO',
+              'Failed to record storage migration rollback: $journalError',
+              journalStackTrace,
+            );
+          }
+          var durableRollbackSucceeded = true;
+          for (final entry in previousTaskPaths.entries) {
+            if (downloadingTasks.any((task) => identical(task, entry.key))) {
+              entry.key.path = entry.value;
+            }
+          }
+          for (final comic in previousComicDirectories.reversed) {
+            try {
+              _db.execute(
+                'UPDATE comics SET directory = ? '
+                'WHERE id = ? AND comic_type = ?;',
+                [comic.directory, comic.id, comic.comicType],
+              );
+            } catch (restoreError, restoreStackTrace) {
+              durableRollbackSucceeded = false;
+              Log.error(
+                'IO',
+                'Failed to restore a local comic path after migration: '
+                    '$restoreError',
+                restoreStackTrace,
+              );
+            }
+          }
+          try {
+            await saveCurrentDownloadingTasks();
+          } catch (restoreError, restoreStackTrace) {
+            durableRollbackSucceeded = false;
+            Log.error(
+              'IO',
+              'Failed to restore download paths after migration: $restoreError',
+              restoreStackTrace,
+            );
+          }
+          try {
+            await writeStringAtomically(configuredPathFile, oldPath);
+          } catch (restoreError, restoreStackTrace) {
+            durableRollbackSucceeded = false;
+            Log.error(
+              'IO',
+              'Failed to restore the configured storage path after migration: '
+                  '$restoreError',
+              restoreStackTrace,
+            );
+          }
+          if (durableRollbackSucceeded) {
+            await newDir.deleteContents(recursive: true).catchError((_) {});
+            try {
+              await migrationJournal.finish();
+            } catch (journalError, journalStackTrace) {
+              Log.error(
+                'IO',
+                'Failed to clear the rolled-back storage migration journal: '
+                    '$journalError',
+                journalStackTrace,
+              );
+            }
+          } else {
+            Log.error(
+              'IO',
+              'Storage migration rollback was not fully persisted; preserving '
+                  'the new directory at $newPath to avoid data loss.',
+            );
+          }
+          resumeQueueIfNeeded();
+          return e.toString();
+        }
+      }
+
+      try {
+        await migrationJournal.writePhase(
+          _LocalPathMigrationPhase.pathCommitted,
+        );
+      } catch (journalError, journalStackTrace) {
+        // local_path already selects the new root. Leaving an older
+        // `committing` phase is safe because startup uses that commit record.
+        Log.error(
+          'IO',
+          'Failed to advance the storage migration journal: $journalError',
+          journalStackTrace,
+        );
+      }
       path = newPath;
-      _checkNoMedia();
+      notifyListeners();
+      try {
+        _checkNoMedia();
+      } catch (error, stackTrace) {
+        Log.error(
+          'IO',
+          'Failed to create .nomedia after migration: $error',
+          stackTrace,
+        );
+      }
+      try {
+        await oldDirectory.deleteContents(recursive: true);
+      } catch (error, stackTrace) {
+        // The new root and persisted queue are already committed. Keeping an
+        // old duplicate is safer than rolling back to a directory that may
+        // have become unavailable between copy and cleanup.
+        Log.error(
+          'IO',
+          'Failed to clean the previous storage path: $error',
+          stackTrace,
+        );
+      }
+      try {
+        await migrationJournal.finish();
+      } catch (journalError, journalStackTrace) {
+        Log.error(
+          'IO',
+          'Failed to clear the committed storage migration journal: '
+              '$journalError',
+          journalStackTrace,
+        );
+      }
+      resumeQueueIfNeeded();
       return null;
     } finally {
       _isChangingPath = false;
+      if (_downloadQueueResumeDeferred) {
+        _downloadQueueResumeDeferred = false;
+        _resumeDownloadQueueOrDefer();
+      }
     }
   }
 
@@ -395,6 +987,7 @@ class LocalManager with ChangeNotifier {
         PRIMARY KEY (id, comic_type)
       );
     ''');
+    ensureLocalLibraryPerformanceIndexes(_db);
     final configuredPathFile = File(FilePath.join(App.dataPath, 'local_path'));
     final hasConfiguredPath = await configuredPathFile.exists();
     if (hasConfiguredPath) {
@@ -429,7 +1022,78 @@ class LocalManager with ChangeNotifier {
     return (int.parse((res.first[0])) + 1).toString();
   }
 
-  Future<void> add(LocalComic comic, [String? id]) async {
+  /// Inserts a newly imported comic without replacing an existing row.
+  ///
+  /// The id is allocated and inserted synchronously inside the caller's local
+  /// database transaction. This is intentionally separate from [add], whose
+  /// update semantics use `INSERT OR REPLACE` for download progress merging.
+  String insertImportedNew(LocalComic comic) {
+    final id = findValidId(comic.comicType);
+    _db.execute(
+      '''
+      INSERT INTO comics (
+        id, title, subtitle, tags, directory, chapters, cover, comic_type,
+        downloadedChapters, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      ''',
+      [
+        id,
+        comic.title,
+        comic.subtitle,
+        jsonEncode(comic.tags),
+        comic.directory,
+        jsonEncode(comic.chapters),
+        comic.cover,
+        comic.comicType.value,
+        jsonEncode(comic.downloadedChapters),
+        comic.createdAt.millisecondsSinceEpoch,
+      ],
+    );
+    return id;
+  }
+
+  /// Removes only the row created by an import receipt.
+  ///
+  /// Matching the unique published directory prevents compensation from
+  /// deleting a different comic that later acquired the same numeric id.
+  bool removeImported(
+    String id,
+    ComicType comicType,
+    String expectedDirectory,
+  ) {
+    _db.execute(
+      'DELETE FROM comics '
+      'WHERE id = ? AND comic_type = ? AND directory = ?;',
+      [id, comicType.value, expectedDirectory],
+    );
+    final removed = (_db.select('SELECT changes();').first[0] as int) > 0;
+    if (removed) notifyListeners();
+    return removed;
+  }
+
+  /// Runs a synchronous import batch in one SQLite savepoint.
+  T runInTransaction<T>(T Function() operation) {
+    _db.execute('SAVEPOINT venera_local_import_batch;');
+    try {
+      final result = operation();
+      if (result is Future) {
+        throw StateError('Local database transactions must be synchronous');
+      }
+      _db.execute('RELEASE SAVEPOINT venera_local_import_batch;');
+      notifyListeners();
+      return result;
+    } catch (_) {
+      try {
+        _db.execute('ROLLBACK TO SAVEPOINT venera_local_import_batch;');
+      } finally {
+        _db.execute('RELEASE SAVEPOINT venera_local_import_batch;');
+        notifyListeners();
+      }
+      rethrow;
+    }
+  }
+
+  void add(LocalComic comic, [String? id]) {
     var old = find(id ?? comic.id, comic.comicType);
     var downloaded = comic.downloadedChapters;
     if (old != null) {
@@ -453,7 +1117,7 @@ class LocalManager with ChangeNotifier {
     notifyListeners();
   }
 
-  void remove(String id, ComicType comicType) async {
+  void remove(String id, ComicType comicType) {
     _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
       id,
       comicType.value,
@@ -463,7 +1127,6 @@ class LocalManager with ChangeNotifier {
 
   void removeComic(LocalComic comic) {
     remove(comic.id, comic.comicType);
-    notifyListeners();
   }
 
   List<LocalComic> getComics(LocalSortType sortType) {
@@ -686,14 +1349,18 @@ class LocalManager with ChangeNotifier {
     add(task.toLocalComic());
     downloadingTasks.remove(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
-    downloadingTasks.firstOrNull?.resume();
+    scheduleCurrentDownloadingTasksSave();
+    _resumeDownloadQueueOrDefer();
   }
 
   void removeTask(DownloadTask task) {
+    final wasCurrent = downloadingTasks.firstOrNull == task;
     downloadingTasks.remove(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
+    scheduleCurrentDownloadingTasksSave();
+    if (wasCurrent) {
+      _resumeDownloadQueueOrDefer();
+    }
   }
 
   void moveToFirst(DownloadTask task) {
@@ -703,43 +1370,94 @@ class LocalManager with ChangeNotifier {
       downloadingTasks.remove(task);
       downloadingTasks.insert(0, task);
       notifyListeners();
-      saveCurrentDownloadingTasks();
+      scheduleCurrentDownloadingTasksSave();
       if (shouldResume) {
-        downloadingTasks.first.resume();
+        _resumeDownloadQueueOrDefer();
       }
     }
   }
 
   Future<void> saveCurrentDownloadingTasks() async {
-    var tasks = downloadingTasks.map((e) => e.toJson()).toList();
-    await File(
-      FilePath.join(App.dataPath, 'downloading_tasks.json'),
-    ).writeAsString(jsonEncode(tasks));
+    final tasks = downloadingTasks.map((task) => task.toJson()).toList();
+    await _downloadingTaskWriter.schedule(jsonEncode(tasks));
+  }
+
+  /// Persists the latest queue state without exposing fire-and-forget write
+  /// failures as unhandled asynchronous errors.
+  void scheduleCurrentDownloadingTasksSave() {
+    unawaited(
+      saveCurrentDownloadingTasks().catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        Log.error(
+          'LocalManager',
+          'Failed to persist download queue: $error',
+          stackTrace,
+        );
+      }),
+    );
   }
 
   void restoreDownloadingTasks() {
-    var file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
-    if (file.existsSync()) {
+    final file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
+    if (!file.existsSync()) return;
+
+    late final String contents;
+    try {
+      contents = file.readAsStringSync();
+    } catch (error, stackTrace) {
+      Log.error(
+        'LocalManager',
+        'Failed to read downloading tasks: $error',
+        stackTrace,
+      );
+      return;
+    }
+
+    final restored = decodeDownloadingTaskQueue<DownloadTask>(
+      contents,
+      DownloadTask.fromJson,
+    );
+    if (restored.requiresFileQuarantine) {
+      String? quarantinedPath;
       try {
-        var tasks = jsonDecode(file.readAsStringSync());
-        for (var e in tasks) {
-          var task = DownloadTask.fromJson(e);
-          if (task != null) {
-            downloadingTasks.add(task);
-          }
-        }
-      } catch (e) {
-        file.delete();
-        Log.error("LocalManager", "Failed to restore downloading tasks: $e");
+        quarantinedPath = _quarantineInvalidDownloadQueue(file).path;
+      } catch (error, stackTrace) {
+        Log.error(
+          'LocalManager',
+          'Failed to quarantine invalid downloading task queue: $error',
+          stackTrace,
+        );
       }
+      final disposition = quarantinedPath == null
+          ? 'The original file was kept in place.'
+          : 'The original file was moved to $quarantinedPath.';
+      Log.error(
+        'LocalManager',
+        'Failed to parse downloading task queue: '
+            '${restored.documentError}. $disposition',
+        restored.documentStackTrace,
+      );
+      return;
+    }
+
+    downloadingTasks.addAll(restored.tasks);
+    for (final failure in restored.failures) {
+      Log.error(
+        'LocalManager',
+        'Skipped invalid downloading task at index ${failure.index}: '
+            '${failure.error}',
+        failure.stackTrace,
+      );
     }
   }
 
   void addTask(DownloadTask task) {
     downloadingTasks.add(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
-    downloadingTasks.first.resume();
+    scheduleCurrentDownloadingTasksSave();
+    _resumeDownloadQueueOrDefer();
   }
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {

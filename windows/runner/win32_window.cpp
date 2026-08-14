@@ -140,7 +140,8 @@ bool Win32Window::Create(const std::wstring& title,
         break;
     }
 
-    SetWindowPos(0, HWND_TOP, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                 SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
     return false;
   }
   Destroy();

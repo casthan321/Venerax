@@ -15,7 +15,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   // Initialize COM, so that it is available for use in the library and/or
   // plugins.
-  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const HRESULT com_result =
+      ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   flutter::DartProject project(L"data");
 
@@ -27,7 +28,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1280, 720);
-  if (!window.Create(L"venera", origin, size)) {
+  if (!window.Create(L"Venera Community", origin, size)) {
+    if (SUCCEEDED(com_result)) {
+      ::CoUninitialize();
+    }
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
@@ -38,6 +42,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::DispatchMessage(&msg);
   }
 
-  ::CoUninitialize();
+  if (SUCCEEDED(com_result)) {
+    ::CoUninitialize();
+  }
   return EXIT_SUCCESS;
 }

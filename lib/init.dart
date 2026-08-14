@@ -2,13 +2,13 @@ import 'dart:async';
 
 import 'package:display_mode/display_mode.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:rhttp/rhttp.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/js_engine.dart';
+import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/cookie_jar.dart';
 import 'package:venera/pages/comic_source_page.dart';
@@ -16,6 +16,7 @@ import 'package:venera/pages/follow_updates_page.dart';
 import 'package:venera/pages/settings/settings_page.dart';
 import 'package:venera/utils/app_links.dart';
 import 'package:venera/utils/handle_text_share.dart';
+import 'package:venera/utils/import_transaction.dart';
 import 'package:venera/utils/opencc.dart';
 import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
@@ -36,6 +37,15 @@ extension _FutureInit<T> on Future<T> {
 
 Future<void> init() async {
   await App.init().wait();
+  // These journals are reconciled before cookie/local/history/favorites
+  // managers can open files that an interrupted transaction may have moved.
+  // Recovery errors intentionally abort startup instead of opening a mixture
+  // of old and new databases.
+  await recoverInterruptedImportTransaction(
+    journalFile: appDataImportJournalFile(App.dataPath),
+    allowedDestinationRoot: App.dataPath,
+  );
+  await recoverInterruptedLocalPathMigration(App.dataPath);
   await SingleInstanceCookieJar.createInstance();
   try {
     var futures = [
@@ -59,21 +69,13 @@ Future<void> init() async {
     handleTextShare();
     try {
       await FlutterDisplayMode.setHighRefreshRate();
-    } catch(e) {
+    } catch (e) {
       Log.error("Display Mode", "Failed to set high refresh rate: $e");
     }
   }
   FlutterError.onError = (details) {
     Log.error("Unhandled Exception", "${details.exception}\n${details.stack}");
   };
-  if (App.isWindows) {
-    // Report to the monitor thread that the app is running
-    // https://github.com/venera-app/venera/issues/343
-    Timer.periodic(const Duration(seconds: 1), (_) {
-      const methodChannel = MethodChannel('venera/method_channel');
-      methodChannel.invokeMethod("heartBeat");
-    });
-  }
 }
 
 void _checkOldConfigs() {
@@ -96,9 +98,12 @@ void _checkOldConfigs() {
     appdata.writeImplicitData();
   }
 
-  if (appdata.settings['comicSourceListUrl'].toString().contains("git.nyne.dev")) {
+  if (appdata.settings['comicSourceListUrl'].toString().contains(
+    "git.nyne.dev",
+  )) {
     // migrate to jsdelivr cdn
-    appdata.settings['comicSourceListUrl'] = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
+    appdata.settings['comicSourceListUrl'] =
+        "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
     appdata.saveData();
   }
 }

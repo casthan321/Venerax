@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:desktop_webview_window/desktop_webview_window.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -11,6 +12,8 @@ import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/proxy.dart';
+import 'package:venera/pages/keyed_future_cache.dart';
+import 'package:venera/pages/webview_diagnostics.dart';
 import 'package:venera/pages/webview_proxy.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/translations.dart';
@@ -21,10 +24,8 @@ export 'package:flutter_inappwebview/flutter_inappwebview.dart'
 
 extension WebviewExtension on InAppWebViewController {
   Future<List<io.Cookie>?> getCookies(String url) async {
-    if (url.contains("https://")) {
-      url.replaceAll("https://", "");
-    }
-    if (url[url.length - 1] == '/') {
+    if (url.isEmpty) return const [];
+    if (url.length > 1 && url.endsWith('/')) {
       url = url.substring(0, url.length - 1);
     }
     CookieManager cookieManager = CookieManager.instance(
@@ -46,7 +47,9 @@ extension WebviewExtension on InAppWebViewController {
   Future<String?> getUA() async {
     var res = await evaluateJavascript(source: "navigator.userAgent");
     if (res is String) {
-      if (res[0] == "'" || res[0] == "\"") {
+      if (res.length >= 2 &&
+          (res[0] == "'" || res[0] == "\"") &&
+          res[res.length - 1] == res[0]) {
         res = res.substring(1, res.length - 1);
       }
     }
@@ -81,6 +84,26 @@ class AppWebview extends StatefulWidget {
 
   static WebViewEnvironment? webViewEnvironment;
 
+  static final _windowsEnvironmentCache =
+      KeyedFutureCache<String?, WebViewEnvironment>((browserArguments) {
+        return WebViewEnvironment.create(
+          settings: WebViewEnvironmentSettings(
+            userDataFolder: "${App.dataPath}\\webview",
+            additionalBrowserArguments: browserArguments,
+          ),
+        );
+      });
+
+  static Future<WebViewEnvironment> getWindowsEnvironment(
+    String? browserArguments,
+  ) async {
+    final environment = await _windowsEnvironmentCache.getOrCreate(
+      browserArguments,
+    );
+    webViewEnvironment = environment;
+    return environment;
+  }
+
   @override
   State<AppWebview> createState() => _AppWebviewState();
 }
@@ -92,11 +115,15 @@ class _AppWebviewState extends State<AppWebview> {
 
   double _progress = 0;
 
+  Uri? _currentUri;
+
+  WebviewFailure? _failure;
+
   late final WebviewProxyConfiguration _proxyConfiguration;
 
   late final WebviewProxyPlatform _proxyPlatform;
 
-  late final Future<bool> future;
+  late Future<WebViewEnvironment?> future;
 
   @override
   void initState() {
@@ -119,9 +146,59 @@ class _AppWebviewState extends State<AppWebview> {
       },
     );
     future = _createWebviewEnvironment();
+    _currentUri = Uri.tryParse(widget.initialUrl);
   }
 
-  Future<bool> _createWebviewEnvironment() async {
+  String get _proxyModeLabel => switch (_proxyConfiguration.mode) {
+    WebviewProxyMode.system => 'System',
+    WebviewProxyMode.direct => 'Direct',
+    WebviewProxyMode.manual => 'Manual',
+  };
+
+  Future<void> _reload() async {
+    final activeController = controller;
+    if (mounted) {
+      setState(() {
+        _failure = null;
+        _progress = 0;
+        if (activeController == null) {
+          future = _createWebviewEnvironment();
+        }
+      });
+    }
+    await activeController?.reload();
+  }
+
+  Future<Uri?> _visibleUri() async {
+    try {
+      final value = await controller?.getUrl();
+      return value == null ? _currentUri : Uri.tryParse(value.toString());
+    } catch (_) {
+      return _currentUri;
+    }
+  }
+
+  Future<void> _openExternally() async {
+    final uri = await _visibleUri();
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
+    await launchUrlString(uri.toString(), mode: LaunchMode.externalApplication);
+  }
+
+  Future<void> _copyVisibleLink() async {
+    final uri = await _visibleUri();
+    if (uri == null) return;
+    await Clipboard.setData(ClipboardData(text: uri.toString()));
+  }
+
+  void _setFailure(WebviewFailure failure) {
+    if (!mounted) return;
+    setState(() {
+      _failure = failure;
+      _progress = 1;
+    });
+  }
+
+  Future<WebViewEnvironment?> _createWebviewEnvironment() async {
     if (_proxyConfiguration.androidAction != AndroidWebviewProxyAction.none) {
       final proxyAvailable = await WebViewFeature.isFeatureSupported(
         WebViewFeature.PROXY_OVERRIDE,
@@ -152,15 +229,11 @@ class _AppWebviewState extends State<AppWebview> {
       }
     }
     if (!App.isWindows) {
-      return true;
+      return null;
     }
-    AppWebview.webViewEnvironment = await WebViewEnvironment.create(
-      settings: WebViewEnvironmentSettings(
-        userDataFolder: "${App.dataPath}\\webview",
-        additionalBrowserArguments: _proxyConfiguration.windowsBrowserArguments,
-      ),
+    return AppWebview.getWindowsEnvironment(
+      _proxyConfiguration.windowsBrowserArguments,
     );
-    return true;
   }
 
   @override
@@ -175,20 +248,17 @@ class _AppWebviewState extends State<AppWebview> {
               MenuEntry(
                 icon: Icons.open_in_browser,
                 text: "Open in browser".tl,
-                onClick: () async =>
-                    launchUrlString((await controller?.getUrl())!.toString()),
+                onClick: _openExternally,
               ),
               MenuEntry(
                 icon: Icons.copy,
                 text: "Copy link".tl,
-                onClick: () async => Clipboard.setData(
-                  ClipboardData(text: (await controller?.getUrl())!.toString()),
-                ),
+                onClick: _copyVisibleLink,
               ),
               MenuEntry(
                 icon: Icons.refresh,
                 text: "Reload".tl,
-                onClick: () => controller?.reload(),
+                onClick: _reload,
               ),
             ]);
           },
@@ -196,27 +266,50 @@ class _AppWebviewState extends State<AppWebview> {
       ),
     ];
 
-    Widget body = FutureBuilder(
+    final body = FutureBuilder<WebViewEnvironment?>(
       future: future,
       builder: (context, e) {
         if (e.error != null) {
-          return Center(child: Text("Error: ${e.error}"));
+          return WebviewFailureView(
+            failure: WebviewFailure(
+              kind: WebviewFailureKind.environment,
+              host: safeWebviewHost(_currentUri),
+              stage: 'WebView initialization',
+              detail: 'The embedded browser environment could not be created.',
+            ),
+            proxyMode: _proxyModeLabel,
+            onRetry: _reload,
+            onOpenExternally: _openExternally,
+          );
         }
-        if (!e.hasData) {
-          return const SizedBox();
+        if (e.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
         }
-        return createWebviewWithEnvironment(AppWebview.webViewEnvironment);
+        return Stack(
+          children: [
+            Positioned.fill(child: createWebviewWithEnvironment(e.data)),
+            if (_progress > 0 && _progress < 1.0)
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: LinearProgressIndicator(value: _progress),
+              ),
+            if (_failure case final failure?)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: context.colorScheme.surface,
+                  child: WebviewFailureView(
+                    failure: failure,
+                    proxyMode: _proxyModeLabel,
+                    onRetry: _reload,
+                    onOpenExternally: _openExternally,
+                  ),
+                ),
+              ),
+          ],
+        );
       },
-    );
-
-    body = Stack(
-      children: [
-        Positioned.fill(child: body),
-        if (_progress < 1.0)
-          const Positioned.fill(
-            child: Center(child: CircularProgressIndicator()),
-          ),
-      ],
     );
 
     return Scaffold(
@@ -231,7 +324,7 @@ class _AppWebviewState extends State<AppWebview> {
   Widget createWebviewWithEnvironment(WebViewEnvironment? e) {
     return InAppWebView(
       webViewEnvironment: e,
-      initialSettings: InAppWebViewSettings(isInspectable: true),
+      initialSettings: InAppWebViewSettings(isInspectable: kDebugMode),
       initialUrlRequest: URLRequest(url: WebUri(widget.initialUrl)),
       onTitleChanged: (c, t) {
         if (mounted) {
@@ -242,18 +335,35 @@ class _AppWebviewState extends State<AppWebview> {
         widget.onTitleChange?.call(title, controller!);
       },
       shouldOverrideUrlLoading: (c, r) async {
-        var res =
-            widget.onNavigation?.call(r.request.url?.toString() ?? "", c) ??
-            false;
+        final nextUrl = r.request.url?.toString() ?? '';
+        final nextUri = Uri.tryParse(nextUrl);
+        final res = widget.onNavigation?.call(nextUrl, c) ?? false;
         if (res) {
           return NavigationActionPolicy.CANCEL;
         } else {
+          if (nextUri != null && mounted) {
+            setState(() {
+              _currentUri = nextUri;
+              _failure = null;
+              _progress = 0;
+            });
+          }
           return NavigationActionPolicy.ALLOW;
         }
       },
       onWebViewCreated: (c) {
         controller = c;
         widget.onStarted?.call(c);
+      },
+      onLoadStart: (c, url) {
+        if (!mounted) return;
+        setState(() {
+          _currentUri = url == null
+              ? _currentUri
+              : Uri.tryParse(url.toString());
+          _failure = null;
+          _progress = 0;
+        });
       },
       onReceivedHttpAuthRequest:
           (App.isWindows || App.isAndroid) &&
@@ -281,7 +391,84 @@ class _AppWebviewState extends State<AppWebview> {
             }
           : null,
       onLoadStop: (c, r) {
+        if (mounted) {
+          setState(() {
+            _currentUri = r == null ? _currentUri : Uri.tryParse(r.toString());
+            _progress = 1;
+          });
+        }
         widget.onLoadStop?.call(c);
+      },
+      onReceivedError: (c, request, error) async {
+        final current = await _visibleUri();
+        final requestUri = Uri.tryParse(request.url.toString());
+        if (requestUri == null ||
+            error.type == WebResourceErrorType.CANCELLED ||
+            !isMainFrameWebRequest(
+              isForMainFrame: request.isForMainFrame,
+              requestUri: requestUri,
+              currentUri: current,
+            )) {
+          return;
+        }
+        _setFailure(
+          WebviewFailure(
+            kind: WebviewFailureKind.network,
+            host: safeWebviewHost(requestUri),
+            stage: 'Main document request',
+            detail: error.description,
+          ),
+        );
+      },
+      onReceivedHttpError: (c, request, response) async {
+        final current = await _visibleUri();
+        final requestUri = Uri.tryParse(request.url.toString());
+        final status = response.statusCode;
+        if (requestUri == null ||
+            status == null ||
+            status < 400 ||
+            // The single-page mode is the user-driven challenge view. Its
+            // expected 403/429 document must remain visible and interactive.
+            (widget.singlePage && (status == 403 || status == 429)) ||
+            !isMainFrameWebRequest(
+              isForMainFrame: request.isForMainFrame,
+              requestUri: requestUri,
+              currentUri: current,
+            )) {
+          return;
+        }
+        _setFailure(
+          WebviewFailure(
+            kind: WebviewFailureKind.http,
+            host: safeWebviewHost(requestUri),
+            stage: 'HTTP response',
+            detail: response.reasonPhrase?.trim().isNotEmpty == true
+                ? response.reasonPhrase!
+                : 'The website returned status $status.',
+            statusCode: status,
+          ),
+        );
+      },
+      onReceivedServerTrustAuthRequest: (c, challenge) async {
+        final protectionSpace = challenge.protectionSpace;
+        _setFailure(
+          WebviewFailure(
+            kind: WebviewFailureKind.tls,
+            host: safeWebviewHost(
+              Uri(
+                scheme: protectionSpace.protocol,
+                host: protectionSpace.host,
+                port: protectionSpace.port,
+              ),
+            ),
+            stage: 'TLS certificate validation',
+            detail:
+                'The certificate was not trusted. Venera Community did not bypass this check.',
+          ),
+        );
+        return ServerTrustAuthResponse(
+          action: ServerTrustAuthResponseAction.CANCEL,
+        );
       },
       onProgressChanged: (c, p) {
         if (mounted) {
@@ -290,6 +477,90 @@ class _AppWebviewState extends State<AppWebview> {
           });
         }
       },
+    );
+  }
+}
+
+class WebviewFailureView extends StatelessWidget {
+  const WebviewFailureView({
+    required this.failure,
+    required this.proxyMode,
+    required this.onRetry,
+    required this.onOpenExternally,
+    super.key,
+  });
+
+  final WebviewFailure failure;
+  final String proxyMode;
+  final Future<void> Function() onRetry;
+  final Future<void> Function() onOpenExternally;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                failure.kind == WebviewFailureKind.tls
+                    ? Icons.gpp_maybe_outlined
+                    : Icons.cloud_off_outlined,
+                size: 48,
+                color: context.colorScheme.error,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                failure.title,
+                style: Theme.of(context).textTheme.titleLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(failure.detail, textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: context.colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Host: ${failure.host}'),
+                    Text('Stage: ${failure.stage}'),
+                    Text('Proxy mode: $proxyMode'),
+                    if (failure.statusCode != null)
+                      Text('HTTP status: ${failure.statusCode}'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: onRetry,
+                    icon: const Icon(Icons.refresh),
+                    label: Text('Retry'.tl),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: onOpenExternally,
+                    icon: const Icon(Icons.open_in_browser),
+                    label: Text('Open in browser'.tl),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -321,23 +592,54 @@ class DesktopWebview {
 
   String? title;
 
+  String? currentUrl;
+
   void onMessage(String message) {
-    var json = jsonDecode(message);
-    if (json is Map) {
-      if (json["id"] == "document_created") {
-        title = json["data"]["title"];
-        _ua = json["data"]["ua"];
-        onTitleChange?.call(title!, this);
+    try {
+      final json = jsonDecode(message);
+      if (json is! Map || json["id"] != "document_created") return;
+      final data = json["data"];
+      if (data is! Map) return;
+      final nextTitle = data["title"];
+      final nextUserAgent = data["ua"];
+      final nextUrl = data["url"];
+      if (nextTitle is! String ||
+          nextUserAgent is! String ||
+          nextUrl is! String) {
+        return;
       }
+      title = nextTitle;
+      _ua = nextUserAgent;
+      currentUrl = nextUrl;
+      onTitleChange?.call(nextTitle, this);
+    } catch (error, stackTrace) {
+      Log.error('Desktop WebView message', error, stackTrace);
     }
   }
 
   String? get userAgent => _ua;
 
   Timer? timer;
+  bool _isPolling = false;
+  bool _closeNotified = false;
+
+  void _notifyClosed() {
+    if (_closeNotified) return;
+    _closeNotified = true;
+    onClose?.call();
+  }
 
   void _runTimer() {
-    timer ??= Timer.periodic(const Duration(seconds: 2), (t) async {
+    timer ??= Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(_pollDocument());
+    });
+  }
+
+  Future<void> _pollDocument() async {
+    final webview = _webview;
+    if (webview == null || _isPolling) return;
+    _isPolling = true;
+    try {
       const js = '''
         function collect() {
           if(document.readyState === 'loading') {
@@ -355,45 +657,76 @@ class DesktopWebview {
         }
         collect();
       ''';
-      if (_webview != null) {
-        onMessage(await evaluateJavascript(js) ?? '');
+      final message = await webview.evaluateJavaScript(js);
+      if (message != null && identical(_webview, webview)) {
+        onMessage(message);
       }
-    });
+    } catch (error, stackTrace) {
+      if (identical(_webview, webview)) {
+        Log.error('Desktop WebView polling', error, stackTrace);
+      }
+    } finally {
+      _isPolling = false;
+    }
   }
 
-  void open() async {
-    _webview = await WebviewWindow.create(
-      configuration: CreateConfiguration(
-        useWindowPositionAndSize: true,
-        userDataFolderWindows: "${App.dataPath}\\webview",
-        title: "webview",
-        proxy: await getProxy(),
-      ),
-    );
-    _webview!.addOnWebMessageReceivedCallback(onMessage);
-    _webview!.setOnNavigation((s) {
-      s = s.substring(1, s.length - 1);
-      return onNavigation?.call(s, this);
-    });
-    _webview!.launch(initialUrl, triggerOnUrlRequestEvent: false);
-    _runTimer();
-    _webview!.onClose.then((value) {
-      _webview = null;
-      timer?.cancel();
-      timer = null;
-      onClose?.call();
-    });
-    Future.delayed(const Duration(milliseconds: 200), () {
-      onStarted?.call(this);
-    });
+  Future<void> open() async {
+    if (_webview != null) return;
+    _closeNotified = false;
+    try {
+      final webview = await WebviewWindow.create(
+        configuration: CreateConfiguration(
+          useWindowPositionAndSize: true,
+          userDataFolderWindows: "${App.dataPath}\\webview",
+          title: "Venera Community WebView",
+          proxy: (await getNetworkProxy())?.credentialFreeUrl,
+        ),
+      );
+      _webview = webview;
+      webview.addOnWebMessageReceivedCallback(onMessage);
+      webview.setOnNavigation((value) {
+        var url = value;
+        try {
+          final decoded = jsonDecode(value);
+          if (decoded is String) url = decoded;
+        } catch (_) {}
+        currentUrl = url;
+        return onNavigation?.call(url, this);
+      });
+      currentUrl = initialUrl;
+      webview.launch(initialUrl, triggerOnUrlRequestEvent: false);
+      _runTimer();
+      unawaited(
+        webview.onClose.then((_) {
+          if (identical(_webview, webview)) {
+            _webview = null;
+          }
+          timer?.cancel();
+          timer = null;
+          _notifyClosed();
+        }),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      if (identical(_webview, webview)) {
+        onStarted?.call(this);
+      }
+    } catch (error, stackTrace) {
+      Log.error('Desktop WebView', error, stackTrace);
+      close();
+      _notifyClosed();
+    }
   }
 
-  Future<String?> evaluateJavascript(String source) {
-    return _webview!.evaluateJavaScript(source);
+  Future<String?> evaluateJavascript(String source) async {
+    final webview = _webview;
+    if (webview == null) return null;
+    return webview.evaluateJavaScript(source);
   }
 
   Future<Map<String, String>> getCookies(String url) async {
-    var allCookies = await _webview!.getAllCookies();
+    final webview = _webview;
+    if (webview == null) return const {};
+    var allCookies = await webview.getAllCookies();
     var res = <String, String>{};
     for (var c in allCookies) {
       if (_cookieMatch(url, c.domain)) {
@@ -426,7 +759,10 @@ class DesktopWebview {
   }
 
   void close() {
-    _webview?.close();
+    final webview = _webview;
     _webview = null;
+    timer?.cancel();
+    timer = null;
+    webview?.close();
   }
 }

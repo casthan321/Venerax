@@ -14,11 +14,27 @@ import 'package:venera/network/images.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/io.dart';
-import 'package:zip_flutter/zip_flutter.dart';
+import 'package:venera/utils/zip_extraction.dart';
 
 import 'download_directory.dart';
 import 'download_state.dart';
+import 'archive_extraction.dart';
 import 'file_downloader.dart';
+
+String archiveUrlForLog(String value) {
+  final uri = Uri.tryParse(value);
+  if (uri == null ||
+      !const {'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
+      uri.host.isEmpty) {
+    return '<invalid archive URL>';
+  }
+  return Uri(
+    scheme: uri.scheme.toLowerCase(),
+    host: uri.host,
+    port: uri.hasPort ? uri.port : null,
+    path: '/archive',
+  ).toString();
+}
 
 abstract class DownloadTask with ChangeNotifier {
   /// 0-1
@@ -34,6 +50,11 @@ abstract class DownloadTask with ChangeNotifier {
   void cancel();
 
   void pause();
+
+  /// Pauses the task and resolves only after in-flight file writes have
+  /// stopped. Callers that move or replace the download root must use this
+  /// instead of relying on the synchronous state change from [pause].
+  Future<void> pauseAndWait() async => pause();
 
   void resume();
 
@@ -59,6 +80,8 @@ abstract class DownloadTask with ChangeNotifier {
     switch (json["type"]) {
       case "ImagesDownloadTask":
         return ImagesDownloadTask.fromJson(json);
+      case 'ArchiveDownloadTask':
+        return ArchiveDownloadTask.fromJson(json);
       default:
         return null;
     }
@@ -195,9 +218,6 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   @override
   void pause() {
-    if (isPaused) {
-      return;
-    }
     _runGuard.stop();
     _message = "Paused";
     _currentSpeed = 0;
@@ -213,11 +233,27 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     for (var i in shouldMove) {
       tasks.remove(i);
     }
-    _pendingWrapperCancellation = cancelledTasks.isEmpty
-        ? null
-        : Future.wait(cancelledTasks.map((task) => task.waitForCancellation()));
+    if (cancelledTasks.isNotEmpty) {
+      final previousCancellation = _pendingWrapperCancellation;
+      _pendingWrapperCancellation = Future.wait(<Future<void>>[
+        if (previousCancellation != null) previousCancellation,
+        ...cancelledTasks.map((task) => task.waitForCancellation()),
+      ]);
+    }
     stopRecorder();
     notifyListeners();
+    LocalManager().scheduleCurrentDownloadingTasksSave();
+  }
+
+  @override
+  Future<void> pauseAndWait() async {
+    pause();
+    final pendingWrapperCancellation = _pendingWrapperCancellation;
+    final pendingAtomicWrite = _pendingAtomicWrite;
+    await Future.wait(<Future<void>>[
+      if (pendingWrapperCancellation != null) pendingWrapperCancellation,
+      if (pendingAtomicWrite != null) pendingAtomicWrite,
+    ]);
   }
 
   @override
@@ -272,11 +308,12 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     int runToken,
     Directory saveTo,
     Set<int> existingImageIndexes,
+    String chapterKey,
+    List<String> images,
   ) {
     if (!_isRunActive(runToken)) {
       return;
     }
-    var images = _images![_images!.keys.elementAt(_chapter)]!;
     var downloading = 0;
     for (var i = _index; i < images.length; i++) {
       if (downloading >= _maxConcurrentTasks) {
@@ -292,7 +329,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
       var task = _ImageDownloadWrapper(
         this,
-        _images!.keys.elementAt(_chapter),
+        chapterKey,
         images[i],
         saveTo,
         i,
@@ -301,94 +338,114 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       tasks[i] = task;
       task.wait().then((task) {
         if (task.isComplete && _isRunActive(runToken)) {
-          _scheduleTasks(runToken, saveTo, existingImageIndexes);
+          _scheduleTasks(
+            runToken,
+            saveTo,
+            existingImageIndexes,
+            chapterKey,
+            images,
+          );
         }
       });
       downloading++;
     }
   }
 
-  Future<bool> _ensureImageLists(int runToken) async {
+  Future<List<String>?> _prepareImageLists(int runToken) async {
     final expectedKeys = _expectedImageListKeys;
     if (chapters != null && expectedKeys.length != chapters!.toSet().length) {
       _setError("Error: Some selected chapters are unavailable");
-      return false;
+      return null;
     }
     if (expectedKeys.isEmpty) {
       _setError("Error: No chapters to download");
+      return null;
+    }
+
+    _images = orderedAvailableImageLists(expectedKeys, _images);
+    _totalCount = knownDownloadImageCount(_images);
+    _message = _totalCount == 0
+        ? 'Preparing download...'
+        : '$_downloadedCount/$_totalCount';
+    notifyListeners();
+    await LocalManager().saveCurrentDownloadingTasks();
+    return _isRunActive(runToken) ? expectedKeys : null;
+  }
+
+  Future<bool> _ensureImageListForChapter(
+    int runToken,
+    String key,
+    int chapterIndex,
+    int chapterCount,
+  ) async {
+    if (_images![key]?.isNotEmpty == true) return true;
+
+    _message = comic!.chapters == null
+        ? 'Fetching image list...'
+        : 'Fetching image list (${chapterIndex + 1}/$chapterCount)...';
+    notifyListeners();
+    final res = await _runWithRetry(() async {
+      final result = await runDownloadImageListLoad(
+        () => source.loadComicPages!(
+          comicId,
+          comic!.chapters == null ? null : key,
+        ),
+      );
+      if (result.error) {
+        throw result.errorMessage ?? 'Failed to fetch image list';
+      }
+      if (result.data.isEmpty) {
+        throw 'Image list is empty';
+      }
+      return List<String>.from(result.data);
+    });
+    if (!_isRunActive(runToken)) return false;
+    if (res.error) {
+      Log.error('Download', res.errorMessage!);
+      _setError('Error: ${res.errorMessage}');
       return false;
     }
 
-    _images ??= {};
-    var fetchedCount =
-        expectedKeys.length -
-        missingImageListKeys(expectedKeys, _images).length;
-
-    for (final key in expectedKeys) {
-      if (_images![key]?.isNotEmpty == true) {
-        continue;
-      }
-
-      _message = comic!.chapters == null
-          ? "Fetching image list..."
-          : "Fetching image list ($fetchedCount/${expectedKeys.length})...";
-      notifyListeners();
-      final res = await _runWithRetry(() async {
-        final r = await runDownloadImageListLoad(
-          () => source.loadComicPages!(
-            comicId,
-            comic!.chapters == null ? null : key,
-          ),
-        );
-        if (r.error) {
-          throw r.errorMessage ?? "Failed to fetch image list";
-        }
-        if (r.data.isEmpty) {
-          throw "Image list is empty";
-        }
-        return List<String>.from(r.data);
-      });
-      if (!_isRunActive(runToken)) {
-        return false;
-      }
-      if (res.error) {
-        Log.error("Download", res.errorMessage!);
-        _setError("Error: ${res.errorMessage}");
-        return false;
-      }
-
-      _images![key] = res.data;
-      fetchedCount++;
-      // Persist partial list progress. A restored task will fetch only the
-      // missing chapters instead of mistaking the partial map for completion.
-      await LocalManager().saveCurrentDownloadingTasks();
-      if (!_isRunActive(runToken)) {
-        return false;
-      }
-    }
-
-    if (!hasCompleteImageLists(expectedKeys, _images)) {
-      _setError("Error: Image list is incomplete");
-      return false;
-    }
-
-    // Serialized maps from an interrupted older version can be partial or in
-    // an unexpected order. Normalize them before using [_chapter] as an index.
-    _images = {for (final key in expectedKeys) key: _images![key]!};
-    _totalCount = _images!.values.fold(
-      0,
-      (total, images) => total + images.length,
-    );
-    _message = "$_downloadedCount/$_totalCount";
+    _images![key] = res.data;
+    _images = orderedAvailableImageLists(_expectedImageListKeys, _images);
+    _totalCount = knownDownloadImageCount(_images);
+    _message = '$_downloadedCount/$_totalCount';
     notifyListeners();
     await LocalManager().saveCurrentDownloadingTasks();
     return _isRunActive(runToken);
   }
 
   @override
-  void resume() async {
+  void resume() {
     if (_runGuard.isRunning) return;
     final runToken = _runGuard.start();
+    unawaited(_resumeSafely(runToken));
+  }
+
+  Future<void> _resumeSafely(int runToken) async {
+    try {
+      await _resume(runToken);
+    } catch (error, stackTrace) {
+      if (_isRunActive(runToken)) {
+        _setError('Error: $error');
+        Log.error(
+          'Download',
+          'Unexpected image download failure: $error',
+          stackTrace,
+        );
+      }
+    } finally {
+      // Every active exit must either complete the task or move it into a
+      // retryable error state. This also protects future early-return branches
+      // from leaving the queue head permanently marked as running.
+      if (_isRunActive(runToken)) {
+        _setError('Error: Download stopped before completion');
+        Log.error('Download', 'Image download stopped before completion');
+      }
+    }
+  }
+
+  Future<void> _resume(int runToken) async {
     _isError = false;
     _message = "Resuming...";
     notifyListeners();
@@ -397,15 +454,23 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     final pendingWrapperCancellation = _pendingWrapperCancellation;
     final pendingAtomicWrite = _pendingAtomicWrite;
     if (pendingWrapperCancellation != null || pendingAtomicWrite != null) {
-      await Future.wait(<Future<void>>[
-        if (pendingWrapperCancellation != null) pendingWrapperCancellation,
-        if (pendingAtomicWrite != null) pendingAtomicWrite,
-      ]);
-      if (identical(_pendingWrapperCancellation, pendingWrapperCancellation)) {
-        _pendingWrapperCancellation = null;
-      }
-      if (identical(_pendingAtomicWrite, pendingAtomicWrite)) {
-        _pendingAtomicWrite = null;
+      try {
+        await Future.wait(<Future<void>>[
+          if (pendingWrapperCancellation != null) pendingWrapperCancellation,
+          if (pendingAtomicWrite != null) pendingAtomicWrite,
+        ]);
+      } finally {
+        // A failed cleanup must not poison every later retry with the same
+        // already-completed Future.
+        if (identical(
+          _pendingWrapperCancellation,
+          pendingWrapperCancellation,
+        )) {
+          _pendingWrapperCancellation = null;
+        }
+        if (identical(_pendingAtomicWrite, pendingAtomicWrite)) {
+          _pendingAtomicWrite = null;
+        }
       }
       if (!_isRunActive(runToken)) {
         return;
@@ -596,7 +661,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
     }
 
-    if (!await _ensureImageLists(runToken)) {
+    final expectedImageListKeys = await _prepareImageLists(runToken);
+    if (expectedImageListKeys == null) {
       return;
     }
 
@@ -608,13 +674,21 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _message = "$_downloadedCount/$_totalCount";
     notifyListeners();
 
-    while (_chapter < _images!.length) {
+    while (_chapter < expectedImageListKeys.length) {
       if (!_isRunActive(runToken)) {
         return;
       }
-      var images = _images![_images!.keys.elementAt(_chapter)]!;
+      final chapterKey = expectedImageListKeys[_chapter];
+      if (!await _ensureImageListForChapter(
+        runToken,
+        chapterKey,
+        _chapter,
+        expectedImageListKeys.length,
+      )) {
+        return;
+      }
+      final images = _images![chapterKey]!;
       tasks.clear();
-      final chapterKey = _images!.keys.elementAt(_chapter);
       final saveTo = comic!.chapters == null
           ? Directory(path!)
           : Directory(
@@ -633,7 +707,13 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         );
         final existingImageIndexes = existingPages.completeFiles.keys.toSet();
         while (_index < images.length) {
-          _scheduleTasks(runToken, saveTo, existingImageIndexes);
+          _scheduleTasks(
+            runToken,
+            saveTo,
+            existingImageIndexes,
+            chapterKey,
+            images,
+          );
           var task = tasks[_index]!;
           await task.wait();
           if (!_isRunActive(runToken)) {
@@ -647,7 +727,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           _index++;
           _downloadedCount++;
           _message = "$_downloadedCount/$_totalCount";
-          await LocalManager().saveCurrentDownloadingTasks();
+          // A restored task re-scans atomically committed image files and
+          // rebuilds these counters. Rewriting the complete image-list JSON
+          // after every page only adds serialization and disk I/O proportional
+          // to the whole comic, and is not needed for resumability.
           if (!_isRunActive(runToken)) {
             return;
           }
@@ -692,8 +775,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (!_isRunActive(runToken)) {
       return;
     }
-    _runGuard.stop();
     LocalManager().completeTask(this);
+    _runGuard.stop();
     stopRecorder();
   }
 
@@ -1057,6 +1140,115 @@ class ArchiveDownloadTask extends DownloadTask {
 
   FileDownloader? _downloader;
 
+  Future<void> _downloaderStop = Future.value();
+
+  Future<void>? _extraction;
+
+  int _runGeneration = 0;
+
+  /// Only directories created exclusively for this archive task may be
+  /// removed on cancellation. Existing library directories belong to users.
+  bool _ownsOutputDirectory = false;
+
+  /// An archive that failed validation must be discarded before a retry. This
+  /// flag is persisted so a restart cannot make a same-sized bad archive look
+  /// complete again.
+  bool _requiresFreshArchive = false;
+
+  bool _isRunActive(int generation) =>
+      _isRunning && generation == _runGeneration;
+
+  Future<void> _stopDownloader() {
+    final downloader = _downloader;
+    _downloader = null;
+    final previousStop = _downloaderStop;
+    final nextStop = () async {
+      await previousStop;
+      await downloader?.stop();
+    }();
+    _downloaderStop = nextStop;
+    return nextStop;
+  }
+
+  File get _archiveFile {
+    return File(
+      FilePath.join(
+        App.dataPath,
+        archiveDownloadCacheFileName(
+          sourceKey: source.key,
+          comicId: comic.id,
+          archiveUrl: archiveUrl,
+        ),
+      ),
+    );
+  }
+
+  File get _archiveRejectionMarker => File('${_archiveFile.path}.rejected');
+
+  Future<void> _deleteArchivePayloadArtifacts() async {
+    await _archiveFile.deleteIgnoreError();
+    await File('${_archiveFile.path}.download').deleteIgnoreError();
+    await File('${_archiveFile.path}.part').deleteIgnoreError();
+  }
+
+  Future<void> _deleteArchiveArtifacts() async {
+    await _deleteArchivePayloadArtifacts();
+    await _archiveRejectionMarker.deleteIgnoreError();
+  }
+
+  Future<void> _rejectArchiveArtifacts() async {
+    _requiresFreshArchive = true;
+    try {
+      await _archiveRejectionMarker.writeAsString('rejected', flush: true);
+    } catch (error, stackTrace) {
+      Log.error(
+        'Archive download',
+        'Failed to persist rejected-archive marker: $error',
+        stackTrace,
+      );
+    }
+    try {
+      // Persist the poison bit before deleting the payload. If the process is
+      // interrupted during cleanup, either this bit or the sidecar marker
+      // forces the next run to discard the old bytes.
+      await LocalManager().saveCurrentDownloadingTasks();
+    } catch (error, stackTrace) {
+      Log.error(
+        'Archive download',
+        'Failed to persist rejected-archive state: $error',
+        stackTrace,
+      );
+    }
+    await _deleteArchivePayloadArtifacts();
+    LocalManager().scheduleCurrentDownloadingTasksSave();
+  }
+
+  Future<void> _prepareFreshArchiveIfRequired() async {
+    final hasRejectionMarker = await _archiveRejectionMarker.exists();
+    if (!_requiresFreshArchive && !hasRejectionMarker) return;
+    await _deleteArchivePayloadArtifacts();
+    final remaining = <File>[
+      _archiveFile,
+      File('${_archiveFile.path}.download'),
+      File('${_archiveFile.path}.part'),
+    ].where((file) => file.existsSync()).toList(growable: false);
+    if (remaining.isNotEmpty) {
+      throw FileSystemException(
+        'A previously rejected archive could not be removed',
+        remaining.first.path,
+      );
+    }
+    await _archiveRejectionMarker.deleteIgnoreError();
+    if (await _archiveRejectionMarker.exists()) {
+      throw FileSystemException(
+        'A rejected-archive marker could not be removed',
+        _archiveRejectionMarker.path,
+      );
+    }
+    _requiresFreshArchive = false;
+    await LocalManager().saveCurrentDownloadingTasks();
+  }
+
   String _message = "Fetching comic info...";
 
   bool _isRunning = false;
@@ -1072,14 +1264,31 @@ class ArchiveDownloadTask extends DownloadTask {
   }
 
   @override
-  void cancel() async {
+  void cancel() {
+    unawaited(_cancelSafely());
+  }
+
+  Future<void> _cancelSafely() async {
+    _runGeneration++;
     _isRunning = false;
-    await _downloader?.stop();
-    if (path != null) {
-      Directory(path!).deleteIgnoreError(recursive: true);
+    try {
+      try {
+        await _stopDownloader();
+        await _extraction;
+      } catch (_) {
+        // Cancellation owns cleanup; the active transfer/extraction error is
+        // no longer useful once the task itself has been canceled.
+      }
+      await _deleteArchiveArtifacts();
+      if (_ownsOutputDirectory && path != null) {
+        await Directory(path!).deleteIgnoreError(recursive: true);
+      }
+    } catch (error, stackTrace) {
+      Log.error('Archive download cancellation', error, stackTrace);
+    } finally {
+      path = null;
+      LocalManager().removeTask(this);
     }
-    path = null;
-    LocalManager().removeTask(this);
   }
 
   @override
@@ -1108,10 +1317,29 @@ class ArchiveDownloadTask extends DownloadTask {
 
   @override
   void pause() {
+    _runGeneration++;
     _isRunning = false;
     _message = "Paused";
-    _downloader?.stop();
+    unawaited(_stopDownloader());
     notifyListeners();
+  }
+
+  @override
+  Future<void> pauseAndWait() async {
+    pause();
+    await _downloaderStop;
+    final extraction = _extraction;
+    if (extraction == null) return;
+    try {
+      await extraction;
+    } on ArchiveExtractionCancelled {
+      // Expected when pause invalidates the transaction before its commit
+      // point. The extractor has already removed staging and restored backup.
+    } finally {
+      if (identical(_extraction, extraction)) {
+        _extraction = null;
+      }
+    }
   }
 
   @override
@@ -1125,38 +1353,61 @@ class ArchiveDownloadTask extends DownloadTask {
     }
     _isError = false;
     _isRunning = true;
+    final runGeneration = ++_runGeneration;
     notifyListeners();
     _message = "Downloading...";
-
-    if (path == null) {
-      var dir = await LocalManager().findValidDirectory(
-        comic.id,
-        comicType,
-        comic.title,
-      );
-      if (!(await dir.exists())) {
-        try {
-          await dir.create();
-        } catch (e) {
-          _setError("Error: $e");
-          return;
-        }
-      }
-      path = dir.path;
-    }
-
-    var archiveFile = File(
-      FilePath.join(App.dataPath, "archive_downloading.zip"),
-    );
-
-    Log.info("Download", "Downloading $archiveUrl");
-
-    _downloader = FileDownloader(archiveUrl, archiveFile.path);
-
-    bool isDownloaded = false;
+    var extractionStarted = false;
 
     try {
-      await for (var status in _downloader!.start()) {
+      await _downloaderStop;
+      final previousExtraction = _extraction;
+      if (previousExtraction != null) {
+        try {
+          await previousExtraction;
+        } catch (_) {
+          // The previous run reports its own extraction error. A new run can
+          // still retry from the intact archive.
+        }
+      }
+      if (!_isRunActive(runGeneration)) {
+        return;
+      }
+
+      if (path == null) {
+        final existingComic = LocalManager().find(comic.id, comicType);
+        var dir = await LocalManager().findValidDirectory(
+          comic.id,
+          comicType,
+          comic.title,
+        );
+        _ownsOutputDirectory = existingComic == null;
+        if (!_isRunActive(runGeneration)) {
+          return;
+        }
+        if (!(await dir.exists())) {
+          await dir.create();
+        }
+        if (!_isRunActive(runGeneration)) {
+          return;
+        }
+        path = dir.path;
+      }
+
+      final archiveFile = _archiveFile;
+      await _prepareFreshArchiveIfRequired();
+      if (!_isRunActive(runGeneration)) {
+        return;
+      }
+      Log.info('Download', 'Downloading ${archiveUrlForLog(archiveUrl)}');
+      final downloader = FileDownloader(archiveUrl, archiveFile.path);
+      _downloader = downloader;
+      var isDownloaded = false;
+
+      await for (var status in downloader.start()) {
+        if (!_isRunActive(runGeneration) ||
+            !identical(_downloader, downloader)) {
+          return;
+        }
         _currentBytes = status.downloadedBytes;
         _expectedBytes = status.totalBytes;
         _message =
@@ -1165,47 +1416,136 @@ class ArchiveDownloadTask extends DownloadTask {
         isDownloaded = status.isFinished;
         notifyListeners();
       }
-    } catch (e) {
-      _setError("Error: $e");
-      return;
+
+      if (!_isRunActive(runGeneration) || !identical(_downloader, downloader)) {
+        return;
+      }
+      _downloader = null;
+      if (!isDownloaded) {
+        throw StateError('Download did not report completion');
+      }
+
+      extractionStarted = true;
+      final extraction = _extractArchive(
+        archiveFile.path,
+        path!,
+        isCancelled: () => !_isRunActive(runGeneration),
+        beforeCommit: () {
+          if (!_isRunActive(runGeneration)) {
+            throw const ArchiveExtractionCancelled();
+          }
+          LocalManager().completeTask(this);
+        },
+      );
+      _extraction = extraction;
+      await extraction;
+      if (!_isRunActive(runGeneration)) {
+        return;
+      }
+      if (identical(_extraction, extraction)) {
+        _extraction = null;
+      }
+      _isRunning = false;
+      _requiresFreshArchive = false;
+      await archiveFile.deleteIgnoreError();
+    } catch (error, stackTrace) {
+      if (extractionStarted && error is! ArchiveExtractionCancelled) {
+        // A fully downloaded archive that cannot be validated/extracted must
+        // never be trusted again by a retry merely because its byte length is
+        // unchanged. This also applies if a pause raced the validation error:
+        // the task may be inactive, but the bad bytes are still bad.
+        await _rejectArchiveArtifacts();
+      }
+      if (!_isRunActive(runGeneration)) return;
+      _downloader = null;
+      _extraction = null;
+      _setError('Error: $error');
+      Log.error('Archive download', error, stackTrace);
     }
-
-    if (!_isRunning) {
-      return;
-    }
-
-    if (!isDownloaded) {
-      _setError("Error: Download failed");
-      return;
-    }
-
-    try {
-      await _extractArchive(archiveFile.path, path!);
-    } catch (e) {
-      _setError("Failed to extract archive: $e");
-      return;
-    }
-
-    await archiveFile.deleteIgnoreError();
-
-    LocalManager().completeTask(this);
   }
 
-  static Future<void> _extractArchive(String archive, String outDir) async {
-    var out = Directory(outDir);
-    if (out is AndroidDirectory) {
-      // Saf directory can't be accessed by native code.
-      var cacheDir = FilePath.join(App.cachePath, "archive_downloading");
-      Directory(cacheDir).forceCreateSync();
-      await Isolate.run(() {
-        ZipFile.openAndExtract(archive, cacheDir);
+  static Future<void> _extractArchive(
+    String archive,
+    String outDir, {
+    required bool Function() isCancelled,
+    required void Function() beforeCommit,
+  }) async {
+    final out = Directory(outDir);
+    await extractArchiveTransactionally(
+      archivePath: archive,
+      outputPath: outDir,
+      scratchRoot: App.cachePath,
+      requiresSafBridge: out is AndroidDirectory,
+      extract: (archivePath, destinationPath) =>
+          Isolate.run(() => extractZipChecked(archivePath, destinationPath)),
+      copy: copyDirectoryIsolate,
+      validate: _normalizeAndValidateExtractedComic,
+      isCancelled: isCancelled,
+      beforeCommit: (_) => beforeCommit(),
+    );
+  }
+
+  static Future<void> _normalizeAndValidateExtractedComic(
+    Directory directory,
+  ) async {
+    // SAF entities carry native document descriptors that belong to the
+    // isolate where they were opened. Pass only the path, start a worker in
+    // the target isolate, and reopen the directory there.
+    final directoryPath = directory.path;
+    if (directory is AndroidDirectory) {
+      await Isolate.run(() async {
+        final worker = SAFTaskWorker();
+        await worker.init();
+        try {
+          await overrideIO(
+            () => _normalizeAndValidateExtractedComicDirectory(
+              Directory(directoryPath),
+            ),
+          );
+        } finally {
+          worker.dispose();
+        }
       });
-      await copyDirectoryIsolate(Directory(cacheDir), Directory(outDir));
-      await Directory(cacheDir).deleteIgnoreError(recursive: true);
-    } else {
-      await Isolate.run(() {
-        ZipFile.openAndExtract(archive, outDir);
-      });
+      return;
+    }
+    await Isolate.run(
+      () => _normalizeAndValidateExtractedComicDirectory(
+        Directory(directoryPath),
+      ),
+    );
+  }
+
+  static Future<void> _normalizeAndValidateExtractedComicDirectory(
+    Directory directory,
+  ) async {
+    var supportedFiles = directory
+        .listSync()
+        .whereType<File>()
+        .where((file) => isSupportedComicImagePath(file.path))
+        .where((file) => file.lengthSync() > 0)
+        .toList();
+    if (supportedFiles.isEmpty) {
+      final entries = directory.listSync();
+      final topDirectories = entries.whereType<Directory>().toList();
+      final topFiles = entries.whereType<File>().toList();
+      if (topDirectories.length == 1 && topFiles.isEmpty) {
+        final nested = topDirectories.single;
+        for (final entity in nested.listSync()) {
+          await entity.rename(FilePath.join(directory.path, entity.name));
+        }
+        await nested.delete();
+        supportedFiles = directory
+            .listSync()
+            .whereType<File>()
+            .where((file) => isSupportedComicImagePath(file.path))
+            .where((file) => file.lengthSync() > 0)
+            .toList();
+      }
+    }
+    if (supportedFiles.isEmpty) {
+      throw const FileSystemException(
+        'Extracted archive contains no supported comic images',
+      );
     }
   }
 
@@ -1222,6 +1562,8 @@ class ArchiveDownloadTask extends DownloadTask {
       "archiveUrl": archiveUrl,
       "comic": comic.toJson(),
       "path": path,
+      "ownsOutputDirectory": _ownsOutputDirectory,
+      "requiresFreshArchive": _requiresFreshArchive,
     };
   }
 
@@ -1230,13 +1572,24 @@ class ArchiveDownloadTask extends DownloadTask {
       return null;
     }
     return ArchiveDownloadTask(
-      json["archiveUrl"],
-      ComicDetails.fromJson(json["comic"]),
-    )..path = json["path"];
+        json["archiveUrl"],
+        ComicDetails.fromJson(json["comic"]),
+      )
+      ..path = json["path"]
+      .._ownsOutputDirectory = json["ownsOutputDirectory"] == true
+      .._requiresFreshArchive = json["requiresFreshArchive"] == true;
   }
 
   String _findCover() {
-    var files = Directory(path!).listSync();
+    var files = Directory(path!)
+        .listSync()
+        .whereType<File>()
+        .where((file) => isSupportedComicImagePath(file.path))
+        .where((file) => file.lengthSync() > 0)
+        .toList();
+    if (files.isEmpty) {
+      throw const FileSystemException('Extracted archive contains no files');
+    }
     for (var f in files) {
       if (f.name.startsWith('cover')) {
         return f.name;

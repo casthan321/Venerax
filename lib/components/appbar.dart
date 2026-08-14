@@ -79,7 +79,8 @@ class _AppbarState extends State<Appbar> {
   Widget build(BuildContext context) {
     var content = Container(
       decoration: BoxDecoration(
-        color: widget.backgroundColor ??
+        color:
+            widget.backgroundColor ??
             context.colorScheme.surface.toOpacity(0.86),
       ),
       height: _kAppBarHeight + context.padding.top,
@@ -94,9 +95,7 @@ class _AppbarState extends State<Appbar> {
                   onPressed: () => Navigator.maybePop(context),
                 ),
               ),
-          const SizedBox(
-            width: 16,
-          ),
+          const SizedBox(width: 16),
           Expanded(
             child: DefaultTextStyle(
               style: DefaultTextStyle.of(context).style.copyWith(fontSize: 20),
@@ -106,9 +105,7 @@ class _AppbarState extends State<Appbar> {
             ),
           ),
           ...?widget.actions,
-          const SizedBox(
-            width: 8,
-          )
+          const SizedBox(width: 8),
         ],
       ).paddingTop(context.padding.top),
     );
@@ -119,18 +116,12 @@ class _AppbarState extends State<Appbar> {
         child: content,
       );
     } else {
-      return BlurEffect(
-        blur: _scrolledUnder ? 15 : 0,
-        child: content,
-      );
+      return BlurEffect(blur: _scrolledUnder ? 15 : 0, child: content);
     }
   }
 }
 
-enum AppbarStyle {
-  blur,
-  shadow,
-}
+enum AppbarStyle { blur, shadow }
 
 class SliverAppbar extends StatelessWidget {
   const SliverAppbar({
@@ -194,7 +185,10 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
     var body = Row(
       children: [
         const SizedBox(width: 8),
@@ -208,9 +202,7 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
                     ),
                   )
                 : const SizedBox()),
-        const SizedBox(
-          width: 16,
-        ),
+        const SizedBox(width: 16),
         Expanded(
           child: DefaultTextStyle(
             style: DefaultTextStyle.of(context).style.copyWith(fontSize: 20),
@@ -220,9 +212,7 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
           ),
         ),
         ...?actions,
-        const SizedBox(
-          width: 8,
-        )
+        const SizedBox(width: 8),
       ],
     ).paddingTop(topPadding);
 
@@ -463,11 +453,11 @@ class _AppTabBarState extends State<AppTabBar> {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: DefaultTextStyle(
             style: DefaultTextStyle.of(context).style.copyWith(
-                  color: i == _controller.animation?.value.round()
-                      ? context.colorScheme.primary
-                      : context.colorScheme.onSurface,
-                  fontWeight: FontWeight.w500,
-                ),
+              color: i == _controller.animation?.value.round()
+                  ? context.colorScheme.primary
+                  : context.colorScheme.onSurface,
+              fontWeight: FontWeight.w500,
+            ),
             child: widget.tabs[i],
           ),
         ),
@@ -476,10 +466,8 @@ class _AppTabBarState extends State<AppTabBar> {
   }
 }
 
-typedef _TabRenderCallback = void Function(
-  List<double> offsets,
-  double itemHeight,
-);
+typedef _TabRenderCallback =
+    void Function(List<double> offsets, double itemHeight);
 
 class _TabRow extends Row {
   const _TabRow({required this.callback, required super.children});
@@ -489,13 +477,14 @@ class _TabRow extends Row {
   @override
   RenderFlex createRenderObject(BuildContext context) {
     return _RenderTabFlex(
-        direction: Axis.horizontal,
-        mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.center,
-        textDirection: Directionality.of(context),
-        verticalDirection: VerticalDirection.down,
-        callback: callback);
+      direction: Axis.horizontal,
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      textDirection: Directionality.of(context),
+      verticalDirection: VerticalDirection.down,
+      callback: callback,
+    );
   }
 
   @override
@@ -592,8 +581,11 @@ class _IndicatorPainter extends CustomPainter {
     final Rect toRect = indicatorRect(size, to);
     _currentRect = Rect.lerp(fromRect, toRect, (value - from).abs());
     final Paint paint = Paint()..color = color;
-    final RRect rrect = RRect.fromRectAndCorners(_currentRect!,
-        topLeft: Radius.circular(radius), topRight: Radius.circular(radius));
+    final RRect rrect = RRect.fromRectAndCorners(
+      _currentRect!,
+      topLeft: Radius.circular(radius),
+      topRight: Radius.circular(radius),
+    );
     canvas.drawRRect(rrect, paint);
   }
 
@@ -656,13 +648,25 @@ class SearchBarController {
   String currentText;
 
   void setText(String text) {
+    currentText = text;
     _state?.setText(text);
   }
 
-  String get text => _state?.getText() ?? '';
+  String get text => _state?.getText() ?? currentText;
 
   set text(String text) {
     setText(text);
+  }
+
+  void _attach(_SearchBarMixin state) {
+    _state = state;
+    state.setText(currentText);
+  }
+
+  void _detach(_SearchBarMixin state) {
+    if (identical(_state, state)) {
+      _state = null;
+    }
   }
 
   SearchBarController({this.onSearch, this.currentText = ''});
@@ -703,15 +707,42 @@ class _SliverSearchBarState extends State<SliverSearchBar>
 
   @override
   void initState() {
-    _controller = widget.controller;
-    _controller._state = this;
-    _editingController = TextEditingController(text: _controller.currentText);
     super.initState();
+    _controller = widget.controller;
+    _editingController = TextEditingController(text: _controller.currentText);
+    _editingController.addListener(_syncControllerText);
+    _controller._attach(this);
+  }
+
+  @override
+  void didUpdateWidget(covariant SliverSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _controller._detach(this);
+      _controller = widget.controller;
+      _controller._attach(this);
+    }
+  }
+
+  void _syncControllerText() {
+    _controller.currentText = _editingController.text;
+  }
+
+  @override
+  void dispose() {
+    _controller._detach(this);
+    _editingController.removeListener(_syncControllerText);
+    _editingController.dispose();
+    super.dispose();
   }
 
   @override
   void setText(String text) {
-    _editingController.text = text;
+    if (_editingController.text == text) return;
+    _editingController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
   }
 
   @override
@@ -761,7 +792,10 @@ class _SliverSearchBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
     return Container(
       height: _kAppBarHeight + topPadding,
       width: double.infinity,
@@ -828,7 +862,10 @@ class _SliverSearchBarDelegate extends SliverPersistentHeaderDelegate {
     return oldDelegate is! _SliverSearchBarDelegate ||
         editingController != oldDelegate.editingController ||
         controller != oldDelegate.controller ||
-        topPadding != oldDelegate.topPadding;
+        topPadding != oldDelegate.topPadding ||
+        onChanged != oldDelegate.onChanged ||
+        action != oldDelegate.action ||
+        focusNode != oldDelegate.focusNode;
   }
 }
 
@@ -850,7 +887,11 @@ class _SearchBarState extends State<AppSearchBar> with _SearchBarMixin {
 
   @override
   void setText(String text) {
-    _editingController.text = text;
+    if (_editingController.text == text) return;
+    _editingController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
   }
 
   @override
@@ -860,10 +901,33 @@ class _SearchBarState extends State<AppSearchBar> with _SearchBarMixin {
 
   @override
   void initState() {
-    _controller = widget.controller;
-    _controller._state = this;
-    _editingController = TextEditingController(text: _controller.currentText);
     super.initState();
+    _controller = widget.controller;
+    _editingController = TextEditingController(text: _controller.currentText);
+    _editingController.addListener(_syncControllerText);
+    _controller._attach(this);
+  }
+
+  @override
+  void didUpdateWidget(covariant AppSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _controller._detach(this);
+      _controller = widget.controller;
+      _controller._attach(this);
+    }
+  }
+
+  void _syncControllerText() {
+    _controller.currentText = _editingController.text;
+  }
+
+  @override
+  void dispose() {
+    _controller._detach(this);
+    _editingController.removeListener(_syncControllerText);
+    _editingController.dispose();
+    super.dispose();
   }
 
   @override

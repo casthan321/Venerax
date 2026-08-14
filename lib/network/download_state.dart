@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
 
 const downloadImageListTimeout = Duration(seconds: 30);
 
@@ -45,6 +48,35 @@ bool hasCompleteImageLists(
 ) {
   final keys = expectedKeys.toList();
   return keys.isNotEmpty && missingImageListKeys(keys, imageLists).isEmpty;
+}
+
+/// Keeps restored image lists in chapter order without requiring every list
+/// to be present. This lets downloading start after the first available
+/// chapter while later chapters are fetched progressively.
+Map<String, List<String>> orderedAvailableImageLists(
+  Iterable<String> expectedKeys,
+  Map<String, List<String>>? imageLists,
+) {
+  return {
+    for (final key in expectedKeys)
+      if (imageLists?[key]?.isNotEmpty == true) key: imageLists![key]!,
+  };
+}
+
+int knownDownloadImageCount(Map<String, List<String>>? imageLists) {
+  if (imageLists == null) return 0;
+  return imageLists.values.fold(0, (total, images) => total + images.length);
+}
+
+String archiveDownloadCacheFileName({
+  required String sourceKey,
+  required String comicId,
+  required String archiveUrl,
+}) {
+  final identity = md5.convert(
+    utf8.encode('$sourceKey\u0000$comicId\u0000$archiveUrl'),
+  );
+  return 'archive_$identity.zip';
 }
 
 bool hasCompleteDownloadedPageIndexes(

@@ -49,7 +49,7 @@ void main(List<String> args) {
               await windowManager.show();
             }
 
-            WindowPlacement.loop();
+            WindowPlacement.startTracking(placement);
           });
         }
       },

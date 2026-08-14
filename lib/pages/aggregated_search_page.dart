@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import "package:flutter/material.dart";
 import 'package:shimmer_animation/shimmer_animation.dart';
 import "package:venera/components/components.dart";
@@ -5,6 +7,7 @@ import "package:venera/foundation/app.dart";
 import "package:venera/foundation/appdata.dart";
 import "package:venera/foundation/comic_source/comic_source.dart";
 import "package:venera/pages/search_result_page.dart";
+import 'package:venera/utils/latest_async_request.dart';
 import "package:venera/utils/translations.dart";
 
 class AggregatedSearchPage extends StatefulWidget {
@@ -91,6 +94,8 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
     with AutomaticKeepAliveClientMixin {
   bool isLoading = true;
 
+  final _latestRequest = LatestAsyncRequest();
+
   static const _kComicHeight = 162.0;
 
   get _comicWidth => _kComicHeight * 0.7;
@@ -101,44 +106,66 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
 
   String? error;
 
-  void load() async {
+  Future<void> _load() async {
+    final token = _latestRequest.start();
     final data = widget.source.searchPageData!;
     var options = (data.searchOptions ?? [])
         .map((e) => e.defaultValue)
         .toList();
-    if (data.loadPage != null) {
-      var res = await data.loadPage!(widget.keyword, 1, options);
-      if (!res.error) {
+    try {
+      final res = data.loadPage != null
+          ? await data.loadPage!(widget.keyword, 1, options)
+          : data.loadNext != null
+          ? await data.loadNext!(widget.keyword, null, options)
+          : null;
+      if (!mounted || !_latestRequest.isCurrent(token)) return;
+      if (res == null) {
         setState(() {
-          comics = res.data;
+          error = "Search is unavailable".tl;
           isLoading = false;
         });
-      } else {
-        setState(() {
-          error = res.errorMessage ?? "Unknown error".tl;
-          isLoading = false;
-        });
-      }
-    } else if (data.loadNext != null) {
-      var res = await data.loadNext!(widget.keyword, null, options);
-      if (!res.error) {
-        setState(() {
-          comics = res.data;
-          isLoading = false;
-        });
-      } else {
+      } else if (res.error) {
         setState(() {
           error = res.errorMessage ?? "Unknown error".tl;
           isLoading = false;
         });
+      } else {
+        setState(() {
+          comics = res.data;
+          isLoading = false;
+        });
       }
+    } catch (loadError) {
+      if (!mounted || !_latestRequest.isCurrent(token)) return;
+      setState(() {
+        error = loadError.toString();
+        isLoading = false;
+      });
     }
   }
 
   @override
   void initState() {
     super.initState();
-    load();
+    unawaited(_load());
+  }
+
+  @override
+  void didUpdateWidget(covariant _SliverSearchResult oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.keyword != widget.keyword ||
+        oldWidget.source.key != widget.source.key) {
+      isLoading = true;
+      comics = null;
+      error = null;
+      unawaited(_load());
+    }
+  }
+
+  @override
+  void dispose() {
+    _latestRequest.invalidate();
+    super.dispose();
   }
 
   Widget buildPlaceHolder() {
@@ -162,9 +189,9 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
 
   @override
   Widget build(BuildContext context) {
-    if (error != null && error!.startsWith("CloudflareException")) {
-      error = "Cloudflare verification required".tl;
-    }
+    final displayError = error?.startsWith("CloudflareException") == true
+        ? "Cloudflare verification required".tl
+        : error;
     super.build(context);
     return InkWell(
       onTap: () {
@@ -209,7 +236,7 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
                 ),
               ),
             )
-          else if (error != null || comics == null || comics!.isEmpty)
+          else if (displayError != null || comics == null || comics!.isEmpty)
             SizedBox(
               height: _kComicHeight,
               child: Column(
@@ -220,7 +247,7 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          error ?? "No search results found".tl,
+                          displayError ?? "No search results found".tl,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),

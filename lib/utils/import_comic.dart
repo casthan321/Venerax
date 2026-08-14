@@ -9,6 +9,8 @@ import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:sqlite3/sqlite3.dart' as sql;
+import 'package:venera/utils/comic_import_transaction.dart';
+import 'package:venera/utils/maintenance_coordinator.dart';
 import 'package:venera/utils/translations.dart';
 import 'cbz.dart';
 import 'io.dart';
@@ -22,46 +24,50 @@ class ImportComic {
 
   Future<bool> cbz() async {
     var file = await selectFile(ext: ['cbz', 'zip', '7z', 'cb7']);
-    Map<String?, List<LocalComic>> imported = {};
     if (file == null) {
       return false;
     }
-    var controller = showLoadingDialog(App.rootContext, allowCancel: false);
-    try {
-      var comic = await CBZ.import(File(file.path));
-      imported[selectedFolder] = [comic];
-    } catch (e, s) {
-      Log.error("Import Comic", e.toString(), s);
-      App.rootContext.showMessage(message: e.toString());
-    }
-    controller.close();
-    return registerComics(imported, false);
+    return MaintenanceCoordinator.instance.run('Import Comics', () async {
+      var controller = showLoadingDialog(App.rootContext, allowCancel: false);
+      PendingCbzImport? pendingImport;
+      try {
+        pendingImport = await CBZ.import(File(file.path));
+      } catch (e, s) {
+        Log.error("Import Comic", e.toString(), s);
+        App.rootContext.showMessage(message: e.toString());
+      }
+      controller.close();
+      if (pendingImport == null) return false;
+      return _registerPendingCbzImports({
+        selectedFolder: [pendingImport],
+      });
+    });
   }
 
   Future<bool> multipleCbz() async {
     var picker = DirectoryPicker();
     var dir = await picker.pickDirectory(directAccess: true);
     if (dir != null) {
-      var files = (await dir.list().toList()).whereType<File>().toList();
-      const supportedExtensions = ['cbz', 'zip', '7z', 'cb7'];
-      files.removeWhere((e) => !supportedExtensions.contains(e.extension));
-      Map<String?, List<LocalComic>> imported = {};
-      var controller = showLoadingDialog(App.rootContext, allowCancel: false);
-      var comics = <LocalComic>[];
-      for (var file in files) {
-        try {
-          var comic = await CBZ.import(file);
-          comics.add(comic);
-        } catch (e, s) {
-          Log.error("Import Comic", e.toString(), s);
+      return MaintenanceCoordinator.instance.run('Import Comics', () async {
+        var files = (await dir.list().toList()).whereType<File>().toList();
+        const supportedExtensions = ['cbz', 'zip', '7z', 'cb7'];
+        files.removeWhere((e) => !supportedExtensions.contains(e.extension));
+        var controller = showLoadingDialog(App.rootContext, allowCancel: false);
+        var pendingImports = <PendingCbzImport>[];
+        for (var file in files) {
+          try {
+            pendingImports.add(await CBZ.import(file));
+          } catch (e, s) {
+            Log.error("Import Comic", e.toString(), s);
+          }
         }
-      }
-      if (comics.isEmpty) {
-        App.rootContext.showMessage(message: "No valid comics found".tl);
-      }
-      imported[selectedFolder] = comics;
-      controller.close();
-      return registerComics(imported, false);
+        if (pendingImports.isEmpty) {
+          App.rootContext.showMessage(message: "No valid comics found".tl);
+        }
+        controller.close();
+        if (pendingImports.isEmpty) return false;
+        return _registerPendingCbzImports({selectedFolder: pendingImports});
+      });
     }
     return false;
   }
@@ -405,42 +411,122 @@ class ImportComic {
 
   Future<bool> registerComics(
     Map<String?, List<LocalComic>> importedComics,
-    bool copy,
-  ) async {
+    bool copy, {
+    Map<LocalComic, PendingComicArtifact>? pendingArtifacts,
+  }) async {
+    late final int importedCount;
+    var artifactOwnershipTransferred = false;
     try {
+      if (copy && pendingArtifacts?.isNotEmpty == true) {
+        throw ArgumentError(
+          'Provisional comic artifacts cannot be copied before registration',
+        );
+      }
       if (copy) {
         importedComics = await _copyComicsToLocalDir(importedComics);
       }
-      int importedCount = 0;
-      for (var folder in importedComics.keys) {
-        for (var comic in importedComics[folder]!) {
-          var id = LocalManager().findValidId(ComicType.local);
-          LocalManager().add(comic, id);
-          importedCount++;
-          if (folder != null) {
-            LocalFavoritesManager().addComic(
-              folder,
-              FavoriteItem(
-                id: id,
-                name: comic.title,
-                coverPath: comic.cover,
-                author: comic.subtitle,
-                type: comic.comicType,
-                tags: comic.tags,
-                favoriteTime: comic.createdAt,
-              ),
+      final entries = <ComicRegistrationEntry<LocalComic>>[
+        for (final folder in importedComics.keys)
+          for (final comic in importedComics[folder]!)
+            ComicRegistrationEntry(
+              comic: comic,
+              folder: folder,
+              artifact: pendingArtifacts?[comic],
+            ),
+      ];
+      final localManager = LocalManager();
+      final favoritesManager = LocalFavoritesManager();
+      artifactOwnershipTransferred = true;
+      importedCount = await registerComicBatchTransactionally(
+        entries: entries,
+        runLocalTransaction: (operation) =>
+            localManager.runInTransaction(operation),
+        runFavoriteTransaction: (operation) =>
+            favoritesManager.runInTransaction(operation),
+        registerLocal: localManager.insertImportedNew,
+        rollbackLocal: (comic, id) {
+          localManager.removeImported(id, comic.comicType, comic.directory);
+        },
+        registerFavorite: (folder, comic, id) => favoritesManager.addComic(
+          folder,
+          _favoriteForImportedComic(comic, id),
+        ),
+        rollbackFavorite: (folder, comic, id) {
+          _rollbackImportedFavorite(favoritesManager, folder, comic, id);
+        },
+      );
+    } catch (e, s) {
+      // Once the helper starts it exclusively owns rollback decisions. In
+      // particular, it preserves a directory when exact DB compensation
+      // fails, preventing a surviving row from pointing at deleted content.
+      if (!artifactOwnershipTransferred && pendingArtifacts != null) {
+        for (final artifact in pendingArtifacts.values.toSet()) {
+          try {
+            await artifact.rollback();
+          } catch (rollbackError, rollbackStackTrace) {
+            Log.error(
+              "Import Comic",
+              "Failed to remove provisional comic data: $rollbackError",
+              rollbackStackTrace,
             );
           }
         }
       }
-      App.rootContext.showMessage(
-        message: "Imported @a comics".tlParams({'a': importedCount}),
-      );
-    } catch (e, s) {
       App.rootContext.showMessage(message: "Failed to register comics".tl);
       Log.error("Import Comic", e.toString(), s);
       return false;
     }
+    App.rootContext.showMessage(
+      message: "Imported @a comics".tlParams({'a': importedCount}),
+    );
     return true;
+  }
+
+  Future<bool> _registerPendingCbzImports(
+    Map<String?, List<PendingCbzImport>> pendingImports,
+  ) {
+    final comics = <String?, List<LocalComic>>{};
+    final artifacts = Map<LocalComic, PendingComicArtifact>.identity();
+    for (final entry in pendingImports.entries) {
+      comics[entry.key] = [
+        for (final pendingImport in entry.value) pendingImport.comic,
+      ];
+      for (final pendingImport in entry.value) {
+        artifacts[pendingImport.comic] = pendingImport;
+      }
+    }
+    return registerComics(comics, false, pendingArtifacts: artifacts);
+  }
+
+  FavoriteItem _favoriteForImportedComic(LocalComic comic, String id) {
+    return FavoriteItem(
+      id: id,
+      name: comic.title,
+      coverPath: comic.cover,
+      author: comic.subtitle,
+      type: comic.comicType,
+      tags: comic.tags,
+      favoriteTime: comic.createdAt,
+    );
+  }
+
+  void _rollbackImportedFavorite(
+    LocalFavoritesManager manager,
+    String folder,
+    LocalComic comic,
+    String id,
+  ) {
+    if (!manager.comicExists(folder, id, comic.comicType)) return;
+    final actual = manager.getComic(folder, id, comic.comicType);
+    final expected = _favoriteForImportedComic(comic, id);
+    if (actual.name != expected.name ||
+        actual.author != expected.author ||
+        actual.coverPath != expected.coverPath ||
+        actual.time != expected.time) {
+      throw StateError(
+        'Favorite $id in "$folder" no longer belongs to this import',
+      );
+    }
+    manager.deleteComicWithId(folder, id, comic.comicType);
   }
 }
