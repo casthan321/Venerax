@@ -360,6 +360,10 @@ class DioRedirectInterceptor extends Interceptor {
 }
 
 class RHttpAdapter implements HttpClientAdapter {
+  RHttpAdapter({this.forceVerifyCertificates = false});
+
+  final bool forceVerifyCertificates;
+
   static final AsyncResourcePool<
     _RHttpTransportConfiguration,
     rhttp.RhttpClient
@@ -380,7 +384,9 @@ class RHttpAdapter implements HttpClientAdapter {
       proxy: proxy,
       dnsOverrides: _getOverrides(),
       sni: appdata.settings['sni'] != false,
-      verifyCertificates: appdata.settings['ignoreBadCertificate'] != true,
+      verifyCertificates:
+          forceVerifyCertificates ||
+          appdata.settings['ignoreBadCertificate'] != true,
       connectTimeout: _enabledTimeout(
         configuredConnectTimeout ?? const Duration(seconds: 15),
       ),

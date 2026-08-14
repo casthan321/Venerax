@@ -126,4 +126,52 @@ void main() {
       );
     },
   );
+
+  test('repository sync opt-out also removes legacy compatibility fields', () {
+    final local = <String, dynamic>{
+      'settings': <String, dynamic>{
+        'comicSourceRepositories': <Object>[],
+        'comicSourceListUrl': 'https://repository.example/index.json',
+        'comicSourceRepositoriesLegacyMirror':
+            'https://repository.example/index.json',
+        'theme_mode': 'dark',
+      },
+      'searchHistory': <String>[],
+    };
+
+    final sanitized = sanitizedAppdataForSync(
+      local,
+      disabledFields: const ['comicSourceRepositories'],
+    );
+    final settings = sanitized['settings'] as Map<String, dynamic>;
+
+    expect(settings, isNot(contains('comicSourceRepositories')));
+    expect(settings, isNot(contains('comicSourceListUrl')));
+    expect(settings, isNot(contains('comicSourceRepositoriesLegacyMirror')));
+    expect(settings['theme_mode'], 'dark');
+  });
+
+  test('legacy repository sync opt-out also removes the repository group', () {
+    final local = <String, dynamic>{
+      'settings': <String, dynamic>{
+        'comicSourceRepositories': <Object>[],
+        'comicSourceListUrl': 'https://repository.example/index.json',
+        'comicSourceRepositoriesLegacyMirror':
+            'https://repository.example/index.json',
+        'theme_mode': 'dark',
+      },
+      'searchHistory': <String>[],
+    };
+
+    final sanitized = sanitizedAppdataForSync(
+      local,
+      disabledFields: const ['comicSourceListUrl'],
+    );
+    final settings = sanitized['settings'] as Map<String, dynamic>;
+
+    expect(settings, isNot(contains('comicSourceRepositories')));
+    expect(settings, isNot(contains('comicSourceListUrl')));
+    expect(settings, isNot(contains('comicSourceRepositoriesLegacyMirror')));
+    expect(settings['theme_mode'], 'dark');
+  });
 }
