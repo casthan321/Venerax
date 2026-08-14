@@ -22,3 +22,16 @@ PhotoViewGalleryPageOptions buildStableGalleryImagePage({
     child: child,
   );
 }
+
+/// Returns zoom-controller pages that are safely outside the gallery's small
+/// live-page window and can be disposed.
+Iterable<int> galleryControllerPagesToEvict({
+  required Iterable<int> controllerPages,
+  required int currentPage,
+  int retainedRadius = 2,
+}) {
+  assert(retainedRadius >= 0);
+  return controllerPages.where(
+    (page) => (page - currentPage).abs() > retainedRadius,
+  );
+}

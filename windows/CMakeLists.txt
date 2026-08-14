@@ -32,6 +32,14 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# C++/WinRT dependencies used by several plugins still rely on the /await
+# compatibility path. MSVC 14.51 turns its experimental-coroutine deprecation
+# into a hard error. Define the documented transition macro at directory scope
+# so plugin subdirectories inherit it even when they do not call
+# apply_standard_settings.
+add_compile_definitions(
+  _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by

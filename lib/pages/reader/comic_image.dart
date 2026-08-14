@@ -84,7 +84,8 @@ class _ComicImageState extends State<ComicImage> with WidgetsBindingObserver {
   Object? _lastException;
   ImageStreamCompleterHandle? _completerHandle;
 
-  static final Map<int, Size> _cache = {};
+  static final ImageSizeCache<ImageProvider, Size> _cache =
+      ImageSizeCache<ImageProvider, Size>(maximumSize: 512);
 
   static clear() => _cache.clear();
 
@@ -339,13 +340,13 @@ class _ComicImageState extends State<ComicImage> with WidgetsBindingObserver {
 
         if (_imageInfo != null) {
           // Record the height and the width of the image
-          _cache[widget.image.hashCode] = Size(
+          _cache[widget.image] = Size(
             _imageInfo!.image.width.toDouble(),
             _imageInfo!.image.height.toDouble(),
           );
         }
 
-        Size? cacheSize = _cache[widget.image.hashCode];
+        Size? cacheSize = _cache[widget.image];
         if (cacheSize != null) {
           if (width == double.infinity) {
             width = constrains.maxWidth;

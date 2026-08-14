@@ -7,7 +7,7 @@ jobs:
   Build_MacOS:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
@@ -55,7 +55,7 @@ jobs:
   Build_IOS:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
@@ -81,7 +81,7 @@ jobs:
   Build_Windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: install dependencies
         run: | 
           choco install yq -y

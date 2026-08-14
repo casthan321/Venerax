@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:venera/network/download.dart' show archiveUrlForLog;
 import 'package:venera/network/download_state.dart';
 
 void main() {
@@ -99,6 +100,19 @@ void main() {
     test('an empty request cannot complete a download', () {
       expect(hasCompleteImageLists(const [], const {}), isFalse);
     });
+
+    test('partial restored lists remain ordered and countable', () {
+      final restored = {
+        'chapter-3': ['3a.jpg'],
+        'chapter-1': ['1a.jpg', '1b.jpg'],
+        'unrequested': ['ignored.jpg'],
+        'chapter-2': <String>[],
+      };
+
+      final ordered = orderedAvailableImageLists(expected, restored);
+      expect(ordered.keys, ['chapter-1', 'chapter-3']);
+      expect(knownDownloadImageCount(ordered), 3);
+    });
   });
 
   group('downloaded page completion', () {
@@ -131,5 +145,40 @@ void main() {
       expect(guard.isActive(firstRun), isFalse);
       expect(guard.isActive(resumedRun), isTrue);
     });
+  });
+
+  test('archive cache names are stable and isolated per task', () {
+    final first = archiveDownloadCacheFileName(
+      sourceKey: 'source-a',
+      comicId: 'comic',
+      archiveUrl: 'https://example.com/a.zip',
+    );
+    final same = archiveDownloadCacheFileName(
+      sourceKey: 'source-a',
+      comicId: 'comic',
+      archiveUrl: 'https://example.com/a.zip',
+    );
+    final other = archiveDownloadCacheFileName(
+      sourceKey: 'source-b',
+      comicId: 'comic',
+      archiveUrl: 'https://example.com/a.zip',
+    );
+
+    expect(first, same);
+    expect(first, isNot(other));
+    expect(first, matches(RegExp(r'^archive_[0-9a-f]{32}\.zip$')));
+  });
+
+  test('archive URL logs never expose credentials or signed locations', () {
+    final safe = archiveUrlForLog(
+      'https://user:password@example.com/private/token/comic.zip?'
+      'signature=secret&expires=999#fragment',
+    );
+
+    expect(safe, 'https://example.com/archive');
+    expect(safe, isNot(contains('password')));
+    expect(safe, isNot(contains('token')));
+    expect(safe, isNot(contains('secret')));
+    expect(archiveUrlForLog('not a URL'), '<invalid archive URL>');
   });
 }

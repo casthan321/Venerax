@@ -30,6 +30,84 @@ const _insertHistorySql = """
 const _historyWriteLockTimeout = Duration(seconds: 5);
 const _historyWriteRetryDelay = Duration(milliseconds: 50);
 
+const _createHistoryTableSql = '''
+  CREATE TABLE IF NOT EXISTS history (
+    id TEXT,
+    title TEXT,
+    subtitle TEXT,
+    cover TEXT,
+    time INTEGER,
+    type INTEGER,
+    ep INTEGER,
+    page INTEGER,
+    readEpisode TEXT,
+    max_page INTEGER,
+    chapter_group INTEGER,
+    PRIMARY KEY (id, type)
+  );
+''';
+
+const _historyColumnList =
+    'id, title, subtitle, cover, time, type, ep, page, '
+    'readEpisode, max_page, chapter_group';
+
+/// Upgrades the legacy id-only primary key to `(id, type)`.
+///
+/// Comic ids are only unique inside a source. Keeping `id` as the sole key
+/// silently replaces a history row when two sources use the same id.
+@visibleForTesting
+void ensureHistorySchema(Database database) {
+  database.execute(_createHistoryTableSql);
+  var columns = database.select('PRAGMA table_info(history);');
+  if (!columns.any((column) => column['name'] == 'chapter_group')) {
+    database.execute('ALTER TABLE history ADD COLUMN chapter_group INTEGER;');
+    columns = database.select('PRAGMA table_info(history);');
+  }
+
+  final primaryKeyColumns =
+      columns.where((column) => (column['pk'] as int) > 0).toList()
+        ..sort((a, b) => (a['pk'] as int).compareTo(b['pk'] as int));
+  final alreadyComposite =
+      primaryKeyColumns.length == 2 &&
+      primaryKeyColumns[0]['name'] == 'id' &&
+      primaryKeyColumns[1]['name'] == 'type';
+  if (alreadyComposite) return;
+
+  database.execute('BEGIN IMMEDIATE;');
+  try {
+    database.execute('DROP TABLE IF EXISTS history_schema_migration;');
+    database.execute(
+      _createHistoryTableSql.replaceFirst(
+        'IF NOT EXISTS history',
+        'history_schema_migration',
+      ),
+    );
+    database.execute('''
+      INSERT OR REPLACE INTO history_schema_migration ($_historyColumnList)
+      SELECT $_historyColumnList FROM history;
+    ''');
+    database.execute('DROP TABLE history;');
+    database.execute('ALTER TABLE history_schema_migration RENAME TO history;');
+    database.execute('COMMIT;');
+  } catch (_) {
+    database.execute('ROLLBACK;');
+    rethrow;
+  }
+}
+
+/// Adds indexes used by the history list without rebuilding existing data.
+///
+/// Both [HistoryManager.getAll] and [HistoryManager.getRecent] are ordered by
+/// the latest read time. Without this index SQLite has to scan the complete
+/// table and create a temporary B-tree whenever a listener refreshes the UI.
+@visibleForTesting
+void ensureHistoryPerformanceIndexes(Database database) {
+  database.execute('''
+    CREATE INDEX IF NOT EXISTS history_time_index
+    ON history(time DESC);
+  ''');
+}
+
 Future<void> _executeHistoryWriteWithLockRetry(
   Database database,
   List<Object?> values,
@@ -264,6 +342,13 @@ class HistoryManager with ChangeNotifier {
 
   HistoryManager.create();
 
+  @visibleForTesting
+  HistoryManager.withDatabase(Database database)
+    : _db = database,
+      _databasePath = '' {
+    isInitialized = true;
+  }
+
   factory HistoryManager() =>
       cache == null ? (cache = HistoryManager.create()) : cache!;
 
@@ -274,10 +359,13 @@ class HistoryManager with ChangeNotifier {
   int get length => _db.select("select count(*) from history;").first[0] as int;
 
   /// Cache of history ids. Improve the performance of find operation.
-  Map<String, bool>? _cachedHistoryIds;
+  Set<String>? _cachedHistoryIds;
 
   /// Cache records recently modified by the app. Improve the performance of listeners.
   final cachedHistories = <String, History>{};
+
+  @visibleForTesting
+  bool get hasLoadedHistoryIdCache => _cachedHistoryIds != null;
 
   bool isInitialized = false;
 
@@ -285,33 +373,22 @@ class HistoryManager with ChangeNotifier {
     if (isInitialized) {
       return;
     }
+    _clearRuntimeCaches();
     _databasePath = "${App.dataPath}/history.db";
-    _db = sqlite3.open(_databasePath);
-
-    _db.execute("""
-        create table if not exists history  (
-          id text primary key,
-          title text,
-          subtitle text,
-          cover text,
-          time int,
-          type int,
-          ep int,
-          page int,
-          readEpisode text,
-          max_page int,
-          chapter_group int
-        );
-      """);
-
-    var columns = _db.select("PRAGMA table_info(history);");
-    if (!columns.any((element) => element["name"] == "chapter_group")) {
-      _db.execute("alter table history add column chapter_group int;");
+    final database = sqlite3.open(_databasePath);
+    _db = database;
+    try {
+      ensureHistorySchema(database);
+      ensureHistoryPerformanceIndexes(database);
+      ImageFavoriteManager().init();
+      isInitialized = true;
+      notifyListeners();
+    } catch (_) {
+      isInitialized = false;
+      _clearRuntimeCaches();
+      database.dispose();
+      rethrow;
     }
-
-    notifyListeners();
-    ImageFavoriteManager().init();
-    isInitialized = true;
   }
 
   final _asyncWrites = HistoryAsyncWriteQueue();
@@ -336,12 +413,9 @@ class HistoryManager with ChangeNotifier {
         if (_cachedHistoryIds == null) {
           updateCache();
         } else {
-          _cachedHistoryIds![newItem.id] = true;
+          _cachedHistoryIds!.add(_historyCacheKey(newItem.id, newItem.type));
         }
-        cachedHistories[newItem.id] = newItem;
-        if (cachedHistories.length > 10) {
-          cachedHistories.remove(cachedHistories.keys.first);
-        }
+        _cacheHistory(newItem);
         notifyListeners();
       },
       onError: (error, stackTrace) {
@@ -377,12 +451,9 @@ class HistoryManager with ChangeNotifier {
     if (_cachedHistoryIds == null) {
       updateCache();
     } else {
-      _cachedHistoryIds![newItem.id] = true;
+      _cachedHistoryIds!.add(_historyCacheKey(newItem.id, newItem.type));
     }
-    cachedHistories[newItem.id] = newItem;
-    if (cachedHistories.length > 10) {
-      cachedHistories.remove(cachedHistories.keys.first);
-    }
+    _cacheHistory(newItem);
     notifyListeners();
   }
 
@@ -420,7 +491,7 @@ class HistoryManager with ChangeNotifier {
     notifyListeners();
   }
 
-  void remove(String id, ComicType type) async {
+  void remove(String id, ComicType type) {
     _db.execute(
       """
       delete from history
@@ -433,15 +504,20 @@ class HistoryManager with ChangeNotifier {
   }
 
   void updateCache() {
-    _cachedHistoryIds = {};
+    _cachedHistoryIds = <String>{};
     var res = _db.select("""
-        select id from history;
+        select id, type from history;
       """);
     for (var element in res) {
-      _cachedHistoryIds![element["id"] as String] = true;
+      _cachedHistoryIds!.add(
+        _historyCacheKey(
+          element['id'] as String,
+          ComicType(element['type'] as int),
+        ),
+      );
     }
     for (var key in cachedHistories.keys.toList()) {
-      if (!_cachedHistoryIds!.containsKey(key)) {
+      if (!_cachedHistoryIds!.contains(key)) {
         cachedHistories.remove(key);
       }
     }
@@ -451,11 +527,13 @@ class HistoryManager with ChangeNotifier {
     if (_cachedHistoryIds == null) {
       updateCache();
     }
-    if (!_cachedHistoryIds!.containsKey(id)) {
+    final cacheKey = _historyCacheKey(id, type);
+    if (!_cachedHistoryIds!.contains(cacheKey)) {
       return null;
     }
-    if (cachedHistories.containsKey(id)) {
-      return cachedHistories[id];
+    final cachedHistory = cachedHistories[cacheKey];
+    if (cachedHistory != null) {
+      return cachedHistory;
     }
 
     var res = _db.select(
@@ -468,7 +546,29 @@ class HistoryManager with ChangeNotifier {
     if (res.isEmpty) {
       return null;
     }
-    return History.fromRow(res.first);
+    final history = History.fromRow(res.first);
+    _cacheHistory(history);
+    return history;
+  }
+
+  void _cacheHistory(History history) {
+    // Removing and reinserting turns the map's insertion order into a tiny
+    // LRU. Frequently opened comics then survive the bounded eviction policy.
+    final cacheKey = _historyCacheKey(history.id, history.type);
+    cachedHistories.remove(cacheKey);
+    cachedHistories[cacheKey] = history;
+    if (cachedHistories.length > 10) {
+      cachedHistories.remove(cachedHistories.keys.first);
+    }
+  }
+
+  static String _historyCacheKey(String id, ComicType type) {
+    return '${type.value}:$id';
+  }
+
+  void _clearRuntimeCaches() {
+    _cachedHistoryIds = null;
+    cachedHistories.clear();
   }
 
   List<History> getAll() {
@@ -498,8 +598,29 @@ class HistoryManager with ChangeNotifier {
   }
 
   void close() {
+    _clearRuntimeCaches();
     isInitialized = false;
     _db.dispose();
+  }
+
+  /// Runs a synchronous batch as one SQLite savepoint and restores all runtime
+  /// caches if any row conversion or write fails.
+  T runInTransaction<T>(T Function() operation) {
+    _db.execute('SAVEPOINT venera_history_batch;');
+    try {
+      final result = operation();
+      _db.execute('RELEASE SAVEPOINT venera_history_batch;');
+      return result;
+    } catch (_) {
+      try {
+        _db.execute('ROLLBACK TO SAVEPOINT venera_history_batch;');
+      } finally {
+        _db.execute('RELEASE SAVEPOINT venera_history_batch;');
+        updateCache();
+        notifyListeners();
+      }
+      rethrow;
+    }
   }
 
   void batchDeleteHistories(List<ComicID> histories) {

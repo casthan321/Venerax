@@ -35,6 +35,8 @@ part 'types.dart';
 class ComicSourceManager with ChangeNotifier, Init {
   final List<ComicSource> _sources = [];
 
+  final List<String> _loadFailures = [];
+
   static ComicSourceManager? _instance;
 
   ComicSourceManager._create();
@@ -52,6 +54,7 @@ class ComicSourceManager with ChangeNotifier, Init {
   @override
   @protected
   Future<void> doInit() async {
+    _loadFailures.clear();
     await JsEngine().ensureInit();
     final path = "${App.dataPath}/comic_source";
     if (!(await Directory(path).exists())) {
@@ -67,16 +70,20 @@ class ComicSourceManager with ChangeNotifier, Init {
           );
           _sources.add(source);
         } catch (e, s) {
+          _loadFailures.add(entity.path);
           Log.error("ComicSource", "$e\n$s");
         }
       }
     }
   }
 
-  Future reload() async {
+  Future<void> reload({bool failOnInvalidSource = false}) async {
     _sources.clear();
     JsEngine().runCode("ComicSource.sources = {};");
     await doInit();
+    if (failOnInvalidSource && _loadFailures.isNotEmpty) {
+      throw ComicSourceLoadException(List.unmodifiable(_loadFailures));
+    }
     notifyListeners();
   }
 
@@ -105,6 +112,16 @@ class ComicSourceManager with ChangeNotifier, Init {
   void notifyStateChange() {
     notifyListeners();
   }
+}
+
+class ComicSourceLoadException implements Exception {
+  const ComicSourceLoadException(this.files);
+
+  final List<String> files;
+
+  @override
+  String toString() =>
+      'Failed to load ${files.length} imported comic source file(s)';
 }
 
 class ComicSource {

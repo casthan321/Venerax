@@ -34,9 +34,12 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/images.dart';
 import 'package:venera/pages/reader/continuous_image_preload.dart';
+import 'package:venera/pages/reader/continuous_visible_page.dart';
 import 'package:venera/pages/reader/fullscreen_transition.dart';
 import 'package:venera/pages/reader/gallery_image_page.dart';
 import 'package:venera/pages/reader/gallery_swipe.dart';
+import 'package:venera/pages/reader/image_preload_tracker.dart';
+import 'package:venera/pages/reader/image_size_cache.dart';
 import 'package:venera/pages/reader/page_animation_guard.dart';
 import 'package:venera/pages/reader/reader_chapter_load.dart';
 import 'package:venera/pages/reader/scroll_tap_guard.dart';
@@ -194,8 +197,14 @@ class _ReaderState extends State<Reader>
 
   var focusNode = FocusNode();
 
+  late final int _imageCacheSizeBeforeReader;
+  int? _imageCacheSizeAppliedByReader;
+
   @override
   void initState() {
+    super.initState();
+    _imageCacheSizeBeforeReader =
+        PaintingBinding.instance.imageCache.maximumSizeBytes;
     page = widget.initialPage ?? 1;
     if (page < 1) {
       page = 1;
@@ -234,11 +243,10 @@ class _ReaderState extends State<Reader>
     )) {
       handleVolumeEvent();
     }
-    setImageCacheSize();
+    unawaited(setImageCacheSize());
     Future.delayed(const Duration(milliseconds: 200), () {
       LocalFavoritesManager().onRead(cid, type);
     });
-    super.initState();
   }
 
   bool _isInitialized = false;
@@ -256,24 +264,29 @@ class _ReaderState extends State<Reader>
     initReaderWindow();
   }
 
-  void setImageCacheSize() async {
-    var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
-    if (availableRAM == null) return;
-    int maxImageCacheSize;
-    if (availableRAM < 1 << 30) {
-      maxImageCacheSize = 100 << 20;
-    } else if (availableRAM < 2 << 30) {
-      maxImageCacheSize = 200 << 20;
-    } else if (availableRAM < 4 << 30) {
-      maxImageCacheSize = 300 << 20;
-    } else {
-      maxImageCacheSize = 500 << 20;
+  Future<void> setImageCacheSize() async {
+    try {
+      var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
+      if (!mounted || availableRAM == null) return;
+      int maxImageCacheSize;
+      if (availableRAM < 1 << 30) {
+        maxImageCacheSize = 100 << 20;
+      } else if (availableRAM < 2 << 30) {
+        maxImageCacheSize = 200 << 20;
+      } else if (availableRAM < 4 << 30) {
+        maxImageCacheSize = 300 << 20;
+      } else {
+        maxImageCacheSize = 500 << 20;
+      }
+      Log.info(
+        "Reader",
+        "Detect available RAM: $availableRAM, set image cache size to $maxImageCacheSize",
+      );
+      PaintingBinding.instance.imageCache.maximumSizeBytes = maxImageCacheSize;
+      _imageCacheSizeAppliedByReader = maxImageCacheSize;
+    } catch (error, stackTrace) {
+      Log.error('Reader memory detection', error, stackTrace);
     }
-    Log.info(
-      "Reader",
-      "Detect available RAM: $availableRAM, set image cache size to $maxImageCacheSize",
-    );
-    PaintingBinding.instance.imageCache.maximumSizeBytes = maxImageCacheSize;
   }
 
   @override
@@ -289,7 +302,12 @@ class _ReaderState extends State<Reader>
     Future.microtask(() {
       DataSync().onDataChanged();
     });
-    PaintingBinding.instance.imageCache.maximumSizeBytes = 100 << 20;
+    final appliedImageCacheSize = _imageCacheSizeAppliedByReader;
+    final imageCache = PaintingBinding.instance.imageCache;
+    if (appliedImageCacheSize != null &&
+        imageCache.maximumSizeBytes == appliedImageCacheSize) {
+      imageCache.maximumSizeBytes = _imageCacheSizeBeforeReader;
+    }
     disposeReaderWindow();
     super.dispose();
   }

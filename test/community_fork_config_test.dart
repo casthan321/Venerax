@@ -37,12 +37,29 @@ void main() {
 
     expect(document, isA<YamlMap>());
     final workflow = document as YamlMap;
-    expect(workflow['name'], 'Android');
+    expect(workflow['name'], 'Android and Windows');
     expect(workflow['on'], isA<YamlMap>());
     final jobs = workflow['jobs'] as YamlMap;
-    expect(jobs.keys, containsAll(<String>['test', 'build-release']));
+    expect(
+      jobs.keys,
+      containsAll(<String>[
+        'test',
+        'build-release',
+        'build-windows',
+        'publish-release',
+      ]),
+    );
     expect(source, contains('ANDROID_SIGNING_CERT_SHA256'));
     expect(source, contains('venera-community-r8-mapping.zip'));
+    expect(source, contains('SHA256SUMS-windows'));
+    expect(
+      source,
+      contains("body_path: doc/releases/\${{ github.ref_name }}.md"),
+    );
+    expect(
+      source,
+      contains("prerelease: \${{ contains(github.ref_name, '-') }}"),
+    );
     expect(
       source,
       contains(
@@ -64,6 +81,18 @@ void main() {
 
     expect(projectLinks, everyElement(contains(canonicalRepository)));
     expect(projectLinks, everyElement(isNot(contains(previousRepository))));
+  });
+
+  test('Beta version metadata and release notes stay in sync', () {
+    final pubspec =
+        loadYaml(File('pubspec.yaml').readAsStringSync()) as YamlMap;
+    final fullVersion = pubspec['version'] as String;
+    final versionName = fullVersion.split('+').first;
+    final appSource = File('lib/foundation/app.dart').readAsStringSync();
+
+    expect(versionName, '1.7.0-beta.1');
+    expect(appSource, contains('final version = "$versionName"'));
+    expect(File('doc/releases/v$versionName.md').lengthSync(), greaterThan(0));
   });
 
   test('workflows do not depend on the previous checkout directory', () {

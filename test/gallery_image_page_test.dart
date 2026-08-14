@@ -20,4 +20,14 @@ void main() {
     expect(page.childSize, const Size(400, 800));
     expect(page.controller, same(controller));
   });
+
+  test('gallery controller retention stays bounded around current page', () {
+    expect(
+      galleryControllerPagesToEvict(
+        controllerPages: [1, 2, 3, 4, 5, 6, 7],
+        currentPage: 4,
+      ),
+      [1, 7],
+    );
+  });
 }

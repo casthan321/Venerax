@@ -66,6 +66,10 @@ class _AboutSettingsState extends State<AboutSettings> {
           title: "Check for updates on startup".tl,
           settingKey: "checkUpdateOnStart",
         ).toSliver(),
+        _SwitchSetting(
+          title: "Receive beta updates".tl,
+          settingKey: "receiveBetaUpdates",
+        ).toSliver(),
         ListTile(
           title: const Text("GitHub (Community Fork)"),
           trailing: const Icon(Icons.open_in_new),
@@ -92,7 +96,12 @@ Future<bool> checkUpdate() async {
   if (res.statusCode == 200) {
     var data = loadYaml(res.data);
     if (data["version"] != null) {
-      return _compareVersion(data["version"].split("+")[0], App.version);
+      final candidate = data["version"].toString();
+      return shouldOfferVersionUpdate(
+        candidate: candidate,
+        current: App.version,
+        allowPreRelease: appdata.settings['receiveBetaUpdates'] == true,
+      );
     }
   }
   return false;
@@ -136,19 +145,4 @@ Future<void> checkUpdateUi([
   } catch (e, s) {
     Log.error("Check Update", e.toString(), s);
   }
-}
-
-/// return true if version1 > version2
-bool _compareVersion(String version1, String version2) {
-  var v1 = version1.split(".");
-  var v2 = version2.split(".");
-  for (var i = 0; i < v1.length; i++) {
-    if (int.parse(v1[i]) > int.parse(v2[i])) {
-      return true;
-    }
-    if (int.parse(v1[i]) < int.parse(v2[i])) {
-      return false;
-    }
-  }
-  return false;
 }

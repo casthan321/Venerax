@@ -65,6 +65,32 @@ void main() {
       );
     });
 
+    test('rebases native download paths into a migrated library', () {
+      expect(
+        FilePath.rebaseWithin(
+          r'D:\Library',
+          r'E:\Comics',
+          r'D:\Library\Title\Chapter',
+        ),
+        r'E:\Comics\Title\Chapter',
+      );
+      expect(
+        FilePath.rebaseWithin(r'D:\Library', r'E:\Comics', r'D:\Other\Title'),
+        isNull,
+      );
+    });
+
+    test('rebases SAF and storage paths without losing the volume', () {
+      expect(
+        FilePath.rebaseWithin(
+          'android://primary:Venera',
+          'android://1234-ABCD:Comics',
+          '/storage/emulated/0/Venera/Title/Chapter',
+        ),
+        'android://1234-ABCD:Comics/Title/Chapter',
+      );
+    });
+
     test(
       'confirms a missing comic directory while the library root is reachable',
       () async {

@@ -1,70 +1,138 @@
 #pragma comment(lib, "winhttp.lib")
 #include "flutter_window.h"
+
+#include <algorithm>
+#include <cstdint>
 #include <optional>
-#include <winhttp.h>
+#include <string>
+#include <utility>
 #include <Windows.h>
-#include <winbase.h>
-#include <flutter/method_channel.h>
+#include <winhttp.h>
+
 #include <flutter/event_channel.h>
 #include <flutter/event_sink.h>
 #include <flutter/event_stream_handler_functions.h>
+#include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
+
 #include "flutter/generated_plugin_registrant.h"
-#include <thread>
 
-#define _CRT_SECURE_NO_WARNINGS
+#include "utils.h"
 
-std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&& mouseEvents = nullptr;
+namespace {
 
-std::atomic<bool> mainThreadAlive(true);
-std::atomic<std::chrono::steady_clock::time_point> lastHeartbeat(std::chrono::steady_clock::now());
-std::thread* monitorThread = nullptr;
+std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> mouse_events;
 
-char* wideCharToMultiByte(wchar_t* pWCStrKey)
-{
-    size_t pSize = WideCharToMultiByte(CP_OEMCP, 0, pWCStrKey, wcslen(pWCStrKey), NULL, 0, NULL, NULL);
-    char* pCStrKey = new char[pSize + 1];
-    WideCharToMultiByte(CP_OEMCP, 0, pWCStrKey, wcslen(pWCStrKey), pCStrKey, pSize, NULL, NULL);
-    pCStrKey[pSize] = '\0';
-    GlobalFree(pWCStrKey);
-    return pCStrKey;
+void AppendProxyCapability(std::string* value, const char* capability) {
+  if (!value->empty()) {
+    value->push_back(';');
+  }
+  value->append(capability);
 }
 
-char* getProxy() {
-    _WINHTTP_CURRENT_USER_IE_PROXY_CONFIG net;
-    WinHttpGetIEProxyConfigForCurrentUser(&net);
-    if (net.lpszProxy == nullptr) {
-        GlobalFree(net.lpszAutoConfigUrl);
-        GlobalFree(net.lpszProxyBypass);
-        return nullptr;
+std::optional<std::string> GetProxy() {
+  WINHTTP_CURRENT_USER_IE_PROXY_CONFIG config{};
+  if (!WinHttpGetIEProxyConfigForCurrentUser(&config)) {
+    return std::nullopt;
+  }
+
+  std::string proxy;
+  if (config.lpszProxy != nullptr) {
+    auto value = Utf8FromUtf16(config.lpszProxy);
+    if (!value.empty()) {
+      proxy = std::move(value);
     }
-    else {
-        GlobalFree(net.lpszAutoConfigUrl);
-        GlobalFree(net.lpszProxyBypass);
-        return wideCharToMultiByte(net.lpszProxy);
-    }
+  }
+  // Only capability markers cross the bridge. PAC URLs and bypass rules may
+  // contain sensitive host names or policy and must never be exposed or logged.
+  if (config.fAutoDetect != FALSE) {
+    AppendProxyCapability(&proxy, "autodetect=1");
+  }
+  if (config.lpszAutoConfigUrl != nullptr &&
+      config.lpszAutoConfigUrl[0] != L'\0') {
+    AppendProxyCapability(&proxy, "autoconfig=1");
+  }
+  if (config.lpszProxyBypass != nullptr && config.lpszProxyBypass[0] != L'\0') {
+    AppendProxyCapability(&proxy, "bypass=1");
+  }
+
+  GlobalFree(config.lpszAutoConfigUrl);
+  GlobalFree(config.lpszProxy);
+  GlobalFree(config.lpszProxyBypass);
+  return proxy.empty() ? std::nullopt
+                       : std::optional<std::string>(std::move(proxy));
 }
+
+void WriteImageToClipboard(
+    const flutter::MethodCall<>& call,
+    const std::unique_ptr<flutter::MethodResult<>>& result) {
+  if (call.arguments() == nullptr ||
+      !std::holds_alternative<flutter::EncodableMap>(*call.arguments())) {
+    result->Error("invalid_arguments", "Expected image arguments.");
+    return;
+  }
+
+  const auto& arguments = std::get<flutter::EncodableMap>(*call.arguments());
+  const auto data_it = arguments.find(flutter::EncodableValue("data"));
+  const auto width_it = arguments.find(flutter::EncodableValue("width"));
+  const auto height_it = arguments.find(flutter::EncodableValue("height"));
+  if (data_it == arguments.end() || width_it == arguments.end() ||
+      height_it == arguments.end() ||
+      !std::holds_alternative<std::vector<uint8_t>>(data_it->second) ||
+      !std::holds_alternative<int32_t>(width_it->second) ||
+      !std::holds_alternative<int32_t>(height_it->second)) {
+    result->Error("invalid_arguments", "Invalid image data.");
+    return;
+  }
+
+  auto data = std::get<std::vector<uint8_t>>(data_it->second);
+  const int32_t width = std::get<int32_t>(width_it->second);
+  const int32_t height = std::get<int32_t>(height_it->second);
+  const uint64_t expected_size =
+      width > 0 && height > 0
+          ? static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4
+          : 0;
+  if (expected_size == 0 || expected_size != data.size()) {
+    result->Error("invalid_arguments", "Invalid image dimensions.");
+    return;
+  }
+
+  // Windows bitmaps use BGRA byte order.
+  for (size_t i = 0; i < data.size(); i += 4) {
+    std::swap(data[i], data[i + 2]);
+  }
+
+  HBITMAP bitmap = CreateBitmap(width, height, 1, 32, data.data());
+  if (bitmap == nullptr) {
+    result->Error("clipboard_error", "Could not create a bitmap.");
+    return;
+  }
+
+  if (!OpenClipboard(nullptr)) {
+    DeleteObject(bitmap);
+    result->Error("clipboard_error", "Could not open the clipboard.");
+    return;
+  }
+
+  EmptyClipboard();
+  if (SetClipboardData(CF_BITMAP, bitmap) == nullptr) {
+    CloseClipboard();
+    DeleteObject(bitmap);
+    result->Error("clipboard_error", "Could not write to the clipboard.");
+    return;
+  }
+
+  // The system owns the bitmap after SetClipboardData succeeds.
+  CloseClipboard();
+  result->Success();
+}
+
+}  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
-
-void monitorUIThread() {
-    const auto timeout = std::chrono::seconds(5);
-
-    while (mainThreadAlive.load()) {
-        auto now = std::chrono::steady_clock::now();
-        auto duration = now - lastHeartbeat.load();
-
-        if (duration > timeout) {
-            std::cerr << "The UI thread is dead. Terminate the application.";
-            std::exit(0);
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-}
 
 bool FlutterWindow::OnCreate() {
   if (!Win32Window::OnCreate()) {
@@ -85,97 +153,54 @@ bool FlutterWindow::OnCreate() {
 
   const flutter::MethodChannel<> channel(
       flutter_controller_->engine()->messenger(), "venera/method_channel",
-      &flutter::StandardMethodCodec::GetInstance()
-  );
+      &flutter::StandardMethodCodec::GetInstance());
   channel.SetMethodCallHandler(
-    [](const flutter::MethodCall<>& call,const std::unique_ptr<flutter::MethodResult<>>& result) {
-      if(call.method_name() == "getProxy"){
-        const auto res = getProxy();
-        if (res != nullptr){
-          std::string s = res;
-          result->Success(s);
+      [](const flutter::MethodCall<>& call,
+         const std::unique_ptr<flutter::MethodResult<>>& result) {
+        if (call.method_name() == "getProxy") {
+          const auto proxy = GetProxy();
+          if (proxy.has_value()) {
+            result->Success(proxy.value());
+          } else {
+            result->Success(flutter::EncodableValue("No Proxy"));
           }
-        else
-          result->Success(flutter::EncodableValue("No Proxy"));
-        delete(res);
-        return;
-      }
-#ifdef NDEBUG
-      else if (call.method_name() == "heartBeat") {
-
-          if (monitorThread == nullptr) {
-              monitorThread = new std::thread{ monitorUIThread };
-          }
-          lastHeartbeat = std::chrono::steady_clock::now();
-          result->Success();
           return;
-      }
-#endif
-      result->Success(); // Default response for unhandled method calls
-  });
+        }
+        result->NotImplemented();
+      });
 
   flutter::EventChannel<> channel2(
-    flutter_controller_->engine()->messenger(), "venera/mouse",
-    &flutter::StandardMethodCodec::GetInstance()
-  );
+      flutter_controller_->engine()->messenger(), "venera/mouse",
+      &flutter::StandardMethodCodec::GetInstance());
 
   auto eventHandler = std::make_unique<
-    flutter::StreamHandlerFunctions<flutter::EncodableValue>>(
-    [](
-      const flutter::EncodableValue* arguments,
-      std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&& events){
-        mouseEvents = std::move(events);
+      flutter::StreamHandlerFunctions<flutter::EncodableValue>>(
+      [](const flutter::EncodableValue* /* arguments */,
+         std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&& events) {
+        mouse_events = std::move(events);
         return nullptr;
-    },
-    [](const flutter::EncodableValue* arguments)
-      -> std::unique_ptr<flutter::StreamHandlerError<flutter::EncodableValue>> {
-        mouseEvents = nullptr;
+      },
+      [](const flutter::EncodableValue* /* arguments */)
+          -> std::unique_ptr<
+              flutter::StreamHandlerError<flutter::EncodableValue>> {
+        mouse_events = nullptr;
         return nullptr;
-    }
-  );
+      });
 
   channel2.SetStreamHandler(std::move(eventHandler));
 
   const flutter::MethodChannel<> channel3(
     flutter_controller_->engine()->messenger(), "venera/clipboard",
-    &flutter::StandardMethodCodec::GetInstance()
-  );
+    &flutter::StandardMethodCodec::GetInstance());
   channel3.SetMethodCallHandler(
-    [](const flutter::MethodCall<>& call,const std::unique_ptr<flutter::MethodResult<>>& result) {
-      if(call.method_name() == "writeImageToClipboard"){
-          flutter::EncodableMap arguments = std::get<flutter::EncodableMap>(*call.arguments());
-          std::vector<uint8_t> data = std::get<std::vector<uint8_t>>(arguments["data"]);
-          std::int32_t width = std::get<std::int32_t>(arguments["width"]);
-          std::int32_t height = std::get<std::int32_t>(arguments["height"]);
-
-          // convert rgba to bgra
-          for (int i = 0; i < data.size()/4; i++) {
-              uint8_t temp = data[i * 4];
-              data[i * 4] = data[i * 4 + 2];
-              data[i * 4 + 2] = temp;
-          }
-          
-          auto bitmap = CreateBitmap((int)width, (int)height, 1, 32, data.data());
-
-          if (!bitmap) {
-              result->Error("0", "Invalid Image Data");
-              return;
-          }
-
-          if (OpenClipboard(NULL))
-          {
-              EmptyClipboard();
-              SetClipboardData(CF_BITMAP, bitmap);
-              CloseClipboard();
-              result->Success();
-          }
-          else {
-              result->Error("Failed to open clipboard");
-          }
-
-          DeleteObject(bitmap);
-      }
-  });
+      [](const flutter::MethodCall<>& call,
+         const std::unique_ptr<flutter::MethodResult<>>& result) {
+        if (call.method_name() == "writeImageToClipboard") {
+          WriteImageToClipboard(call, result);
+          return;
+        }
+        result->NotImplemented();
+      });
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
@@ -197,18 +222,13 @@ void FlutterWindow::OnDestroy() {
   }
 
   Win32Window::OnDestroy();
-  if (monitorThread != nullptr) {
-      mainThreadAlive = false;
-      monitorThread->join();
-  }
+  mouse_events = nullptr;
 }
 
-void mouse_side_button_listener(unsigned int input)
-{
-    if(mouseEvents != nullptr)
-    {
-        mouseEvents->Success(static_cast<int>(input));
-    }
+void mouse_side_button_listener(unsigned int input) {
+  if (mouse_events != nullptr) {
+    mouse_events->Success(static_cast<int>(input));
+  }
 }
 
 LRESULT
@@ -216,29 +236,28 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
   // Give Flutter, including plugins, an opportunity to handle window messages.
-    UINT button = GET_XBUTTON_WPARAM(wparam);
-    if (button == XBUTTON1 && message == 528)
-    {
-        mouse_side_button_listener(0);
-    }
-    else if (button == XBUTTON2 && message == 528)
-    {
-        mouse_side_button_listener(1);
-    }
-    if (flutter_controller_) {
-        std::optional<LRESULT> result =
-            flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,
+  UINT button = GET_XBUTTON_WPARAM(wparam);
+  if (button == XBUTTON1 && message == WM_XBUTTONDOWN) {
+    mouse_side_button_listener(0);
+  } else if (button == XBUTTON2 && message == WM_XBUTTONDOWN) {
+    mouse_side_button_listener(1);
+  }
+  if (flutter_controller_) {
+    std::optional<LRESULT> result =
+        flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,
                                                       lparam);
-        if (result) {
-          return *result;
-        }
+    if (result) {
+      return *result;
     }
+  }
 
-    switch (message) {
-      case WM_FONTCHANGE:
-          flutter_controller_->engine()->ReloadSystemFonts();
-          break;
-    }
+  switch (message) {
+    case WM_FONTCHANGE:
+      if (flutter_controller_) {
+        flutter_controller_->engine()->ReloadSystemFonts();
+      }
+      break;
+  }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
 }

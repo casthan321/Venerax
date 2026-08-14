@@ -229,56 +229,64 @@ class LocalFavoritesManager with ChangeNotifier {
   Future<void> init() async {
     counts = {};
     _databasePath = "${App.dataPath}/local_favorite.db";
-    _db = sqlite3.open(_databasePath);
-    _db.execute("""
+    final database = sqlite3.open(_databasePath);
+    _db = database;
+    try {
+      _db.execute("""
       create table if not exists folder_order (
         folder_name text primary key,
         order_value int
       );
     """);
-    _db.execute("""
+      _db.execute("""
       create table if not exists folder_sync (
         folder_name text primary key,
         source_key text,
         source_folder text
       );
     """);
-    var folderNames = _getFolderNamesWithDB();
-    for (var folder in folderNames) {
-      var columns = _db.select("""
+      var folderNames = _getFolderNamesWithDB();
+      for (var folder in folderNames) {
+        var columns = _db.select("""
         pragma table_info("$folder");
       """);
-      if (!columns.any((element) => element["name"] == "translated_tags")) {
-        _db.execute("""
+        if (!columns.any((element) => element["name"] == "translated_tags")) {
+          _db.execute("""
           alter table "$folder"
           add column translated_tags TEXT;
         """);
-        var comics = getFolderComics(folder);
-        for (var comic in comics) {
-          var translatedTags = _translateTags(comic.tags);
-          _db.execute(
-            """
+          var comics = getFolderComics(folder);
+          for (var comic in comics) {
+            var translatedTags = _translateTags(comic.tags);
+            _db.execute(
+              """
             update "$folder"
             set translated_tags = ?
             where id == ? and type == ?;
           """,
-            [translatedTags, comic.id, comic.type.value],
-          );
+              [translatedTags, comic.id, comic.type.value],
+            );
+          }
+        } else {
+          break;
         }
-      } else {
-        break;
       }
+      await appdata.ensureInit();
+      // Make sure the follow updates folder is ready
+      var followUpdateFolder = appdata.settings['followUpdatesFolder'];
+      if (followUpdateFolder is String &&
+          folderNames.contains(followUpdateFolder)) {
+        prepareTableForFollowUpdates(followUpdateFolder, false);
+      } else {
+        appdata.settings['followUpdatesFolder'] = null;
+      }
+      initCounts();
+    } catch (_) {
+      counts = {};
+      _hashedIds = {};
+      database.dispose();
+      rethrow;
     }
-    await appdata.ensureInit();
-    // Make sure the follow updates folder is ready
-    var followUpdateFolder = appdata.settings['followUpdatesFolder'];
-    if (followUpdateFolder is String &&
-        folderNames.contains(followUpdateFolder)) {
-      prepareTableForFollowUpdates(followUpdateFolder, false);
-    } else {
-      appdata.settings['followUpdatesFolder'] = null;
-    }
-    initCounts();
   }
 
   void initCounts() {
@@ -1004,7 +1012,7 @@ class LocalFavoritesManager with ChangeNotifier {
     await init();
   }
 
-  void reorder(List<FavoriteItem> newFolder, String folder) async {
+  void reorder(List<FavoriteItem> newFolder, String folder) {
     if (!existsFolder(folder)) {
       throw Exception("Failed to reorder: folder not found");
     }
@@ -1061,7 +1069,7 @@ class LocalFavoritesManager with ChangeNotifier {
     notifyListeners();
   }
 
-  void onRead(String id, ComicType type) async {
+  void onRead(String id, ComicType type) {
     if (appdata.settings['moveFavoriteAfterRead'] == "none") {
       markAsRead(id, type);
       return;
@@ -1403,6 +1411,27 @@ class LocalFavoritesManager with ChangeNotifier {
 
   void close() {
     _db.dispose();
+  }
+
+  /// Runs a synchronous batch as one SQLite savepoint. In-memory counts and
+  /// hashes are rebuilt after rollback so a failed import cannot leave the UI
+  /// presenting rows that were never committed.
+  T runInTransaction<T>(T Function() operation) {
+    _db.execute('SAVEPOINT venera_favorites_batch;');
+    try {
+      final result = operation();
+      _db.execute('RELEASE SAVEPOINT venera_favorites_batch;');
+      return result;
+    } catch (_) {
+      try {
+        _db.execute('ROLLBACK TO SAVEPOINT venera_favorites_batch;');
+      } finally {
+        _db.execute('RELEASE SAVEPOINT venera_favorites_batch;');
+        initCounts();
+        notifyListeners();
+      }
+      rethrow;
+    }
   }
 
   void notifyChanges() {

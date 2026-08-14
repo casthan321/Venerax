@@ -1,6 +1,7 @@
 package io.github.casthan321.venera
 
 import android.Manifest
+import android.annotation.TargetApi
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ContentResolver
@@ -9,6 +10,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -33,57 +36,73 @@ import io.flutter.plugins.GeneratedPluginRegistrant
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : FlutterFragmentActivity() {
-    var volumeListen = VolumeListen()
-    var listening = false
+    private val volumeListen = VolumeListen()
+    private var listening = false
 
     private val storageRequestCode = 0x10
-    private var storagePermissionRequest: ((Boolean) -> Unit)? = null
+    private val storagePermissionRequests = ArrayList<(Boolean) -> Unit>()
+    private var storagePermissionInFlight = false
 
     private val nextLocalRequestCode = AtomicInteger()
 
-    private val sharedTexts = ArrayList<String>()
+    private val sharedTexts = ArrayDeque<String>()
 
     private var textShareHandler: ((String) -> Unit)? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "venera-picker-io").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var activityDestroyed = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        if (intent?.action == Intent.ACTION_SEND) {
-            if (intent.type == "text/plain") {
-                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-                if (text != null)
-                    handleSharedText(text)
-            }
-        }
+        handleShareIntent(intent)
+        prunePickerCacheAsync()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.action == Intent.ACTION_SEND) {
-            if (intent.type == "text/plain") {
-                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-                if (text != null)
-                    handleSharedText(text)
-            }
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND ||
+            intent.type?.lowercase(Locale.ROOT)?.startsWith("text/") != true
+        ) {
+            return
         }
+        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+        if (!text.isNullOrBlank()) handleSharedText(text)
     }
 
     private fun handleSharedText(text: String) {
         if (textShareHandler != null) {
             textShareHandler?.invoke(text)
         } else {
-            sharedTexts.add(text)
+            if (sharedTexts.size == MAX_QUEUED_SHARED_TEXTS) {
+                sharedTexts.removeFirst()
+            }
+            sharedTexts.addLast(text)
         }
     }
 
     private fun <I, O> startContractForResult(
         contract: ActivityResultContract<I, O>,
         input: I,
-        callback: ActivityResultCallback<O>
+        callback: ActivityResultCallback<O>,
+        onLaunchError: (Exception) -> Unit
     ) {
         val key = "activity_rq_for_result#${nextLocalRequestCode.getAndIncrement()}"
         val registry = activityResultRegistry
@@ -102,8 +121,14 @@ class MainActivity : FlutterFragmentActivity() {
             lifecycle.removeObserver(observer)
             callback.onActivityResult(it)
         }
-        launcher = registry.register(key, contract, newCallback)
-        launcher.launch(input)
+        try {
+            launcher = registry.register(key, contract, newCallback)
+            launcher.launch(input)
+        } catch (error: Exception) {
+            launcher?.unregister()
+            lifecycle.removeObserver(observer)
+            onLaunchError(error)
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -127,17 +152,25 @@ class MainActivity : FlutterFragmentActivity() {
                 "getDirectoryPath" -> {
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-                    startContractForResult(ActivityResultContracts.StartActivityForResult(), intent) { activityResult ->
-                        if (activityResult.resultCode != Activity.RESULT_OK) {
-                            res.success(null)
-                            return@startContractForResult
+                    startContractForResult(
+                        contract = ActivityResultContracts.StartActivityForResult(),
+                        input = intent,
+                        callback = { activityResult ->
+                            if (activityResult.resultCode != Activity.RESULT_OK) {
+                                res.success(null)
+                            } else {
+                                val pickedDirectoryUri = activityResult.data?.data
+                                if (pickedDirectoryUri == null) {
+                                    res.success(null)
+                                } else {
+                                    onPickedDirectory(pickedDirectoryUri, res)
+                                }
+                            }
+                        },
+                        onLaunchError = { error ->
+                            res.error("picker unavailable", error.message, null)
                         }
-                        val pickedDirectoryUri = activityResult.data?.data
-                        if (pickedDirectoryUri == null)
-                            res.success(null)
-                        else
-                            onPickedDirectory(pickedDirectoryUri, res)
-                    }
+                    )
                 }
 
                 "openFolder" -> {
@@ -164,6 +197,7 @@ class MainActivity : FlutterFragmentActivity() {
 
                 override fun onCancel(arguments: Any?) {
                     listening = false
+                    volumeListen.clear()
                 }
             })
 
@@ -176,22 +210,18 @@ class MainActivity : FlutterFragmentActivity() {
 
         val selectFileChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "venera/select_file")
         selectFileChannel.setMethodCallHandler { req, res ->
-            val mimeType = req.arguments<String>()
-            openFile(res, mimeType!!)
+            openFile(res, AndroidBridgeUtils.sanitizeMimeType(req.arguments<String>()))
         }
 
         val shareTextChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, "venera/text_share")
         shareTextChannel.setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
-                    textShareHandler = {text ->
+                    textShareHandler = { text ->
                         events.success(text)
                     }
-                    if (sharedTexts.isNotEmpty()) {
-                        for (text in sharedTexts) {
-                            events.success(text)
-                        }
-                        sharedTexts.clear()
+                    while (sharedTexts.isNotEmpty()) {
+                        events.success(sharedTexts.removeFirst())
                     }
                 }
 
@@ -333,13 +363,17 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private fun getProxy(): String {
-        val host = System.getProperty("http.proxyHost")
-        val port = System.getProperty("http.proxyPort")
-        return if (host != null && port != null) {
-            "$host:$port"
-        } else {
-            "No Proxy"
-        }
+        val proxies = ArrayList<String>(2)
+        proxyEndpoint("https")?.let { proxies.add("https=$it") }
+        proxyEndpoint("http")?.let { proxies.add("http=$it") }
+        return if (proxies.isEmpty()) "No Proxy" else proxies.joinToString(";")
+    }
+
+    private fun proxyEndpoint(scheme: String): String? {
+        return AndroidBridgeUtils.formatProxyEndpoint(
+            System.getProperty("$scheme.proxyHost"),
+            System.getProperty("$scheme.proxyPort")
+        )
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -361,67 +395,67 @@ class MainActivity : FlutterFragmentActivity() {
 
     /// Ensure that the directory is accessible by dart:io
     private fun onPickedDirectory(uri: Uri, result: MethodChannel.Result) {
-        if (hasStoragePermission()) {
-            var plain = uri.toString()
-            if(plain.contains("%3A")) {
-                plain = Uri.decode(plain)
+        submitIo(
+            onRejected = {
+                result.error("copy error", "The file worker is unavailable", null)
             }
-            val externalStoragePrefix = "content://com.android.externalstorage.documents/tree/primary:";
-            if(plain.startsWith(externalStoragePrefix)) {
-                val path = plain.substring(externalStoragePrefix.length)
-                result.success(Environment.getExternalStorageDirectory().absolutePath + "/" + path)
-                return
-            }
-            // The uri cannot be parsed to plain path, use copy method
-        }
-        // dart:io cannot access the directory without permission.
-        // so we need to copy the directory to cache directory
-        val contentResolver = contentResolver
-        val safeDirName = safeDocumentName(DocumentFile.fromTreeUri(this, uri)?.name)
-        if (safeDirName == null) {
-            result.error("copy error", "Selected directory has no valid name", null)
-            return
-        }
-        var tmp = File(cacheDir, safeDirName)
-        if (tmp.exists() && !tmp.deleteRecursively()) {
-            result.error("copy error", "Cannot clear the temporary directory", null)
-            return
-        }
-        if (!tmp.mkdirs() && !tmp.isDirectory) {
-            result.error("copy error", "Cannot create the temporary directory", null)
-            return
-        }
-        Thread {
+        ) {
+            var destination: File? = null
             try {
-                copyDirectory(contentResolver, uri, tmp)
-                result.success(tmp.absolutePath)
-            }
-            catch (e: Exception) {
-                result.error("copy error", e.message, null)
-            }
-        }.start()
+                if (hasStoragePermission()) {
+                    val directPath = documentTreeToExternalPath(uri)
+                    if (directPath != null) {
+                        completeOnMain { result.success(directPath) }
+                        return@submitIo
+                    }
+                }
 
+                val source = DocumentFile.fromTreeUri(this, uri)
+                    ?: throw IOException("Cannot access the selected directory")
+                val safeDirName = AndroidBridgeUtils.safeDocumentName(source.name)
+                    ?: throw IOException("Selected directory has no valid name")
+                val copyDestination = createUniqueCacheDirectory(safeDirName)
+                destination = copyDestination
+                copyDirectory(contentResolver, source, copyDestination, depth = 0)
+                val copiedPath = copyDestination.absolutePath
+                completeOnMain { result.success(copiedPath) }
+            } catch (error: Exception) {
+                destination?.deleteRecursively()
+                completeOnMain {
+                    result.error("copy error", error.message ?: "Cannot copy directory", null)
+                }
+            }
+        }
     }
 
-    private fun copyDirectory(resolver: ContentResolver, srcUri: Uri, destDir: File) {
-        val src = DocumentFile.fromTreeUri(this, srcUri)
-            ?: throw IOException("Cannot access the selected directory")
+    private fun copyDirectory(
+        resolver: ContentResolver,
+        src: DocumentFile,
+        destDir: File,
+        depth: Int
+    ) {
+        if (depth > MAX_DIRECTORY_DEPTH) {
+            throw IOException("The selected directory is nested too deeply")
+        }
         for (file in src.listFiles()) {
-            val childName = safeDocumentName(file.name)
+            val childName = AndroidBridgeUtils.safeDocumentName(file.name)
                 ?: throw IOException("A selected file has no valid name")
             if (file.isDirectory) {
                 val newDir = File(destDir, childName)
-                if (!newDir.mkdirs() && !newDir.isDirectory) {
+                if (!newDir.mkdir()) {
                     throw IOException("Cannot create ${newDir.path}")
                 }
-                copyDirectory(resolver, file.uri, newDir)
+                copyDirectory(resolver, file, newDir, depth + 1)
             } else {
                 val newFile = File(destDir, childName)
+                if (!newFile.createNewFile()) {
+                    throw IOException("Duplicate file name: $childName")
+                }
                 val inputStream = resolver.openInputStream(file.uri)
                     ?: throw IOException("Cannot read ${file.uri}")
                 inputStream.use { input ->
                     FileOutputStream(newFile).use { output ->
-                        input.copyTo(output, bufferSize = DEFAULT_BUFFER_SIZE)
+                        input.copyTo(output, bufferSize = COPY_BUFFER_SIZE)
                         output.flush()
                     }
                 }
@@ -429,40 +463,88 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
-    private fun safeDocumentName(name: String?): String? {
-        if (name.isNullOrBlank() || name == "." || name == "..") return null
-        val fileName = File(name).name
-        return if (fileName == name) fileName else null
+    private fun documentTreeToExternalPath(uri: Uri): String? {
+        if (uri.authority != EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY) return null
+        val documentId = try {
+            DocumentsContract.getTreeDocumentId(uri)
+        } catch (error: Exception) {
+            return null
+        }
+        val separator = documentId.indexOf(':')
+        if (separator <= 0) return null
+        val volumeId = documentId.substring(0, separator)
+        val relativePath = documentId.substring(separator + 1)
+        if (!AndroidBridgeUtils.isSafeRelativePath(relativePath)) return null
+
+        val root = when {
+            volumeId.equals("primary", ignoreCase = true) ->
+                Environment.getExternalStorageDirectory()
+            REMOVABLE_VOLUME_ID.matches(volumeId) ->
+                File("/storage/${volumeId.uppercase(Locale.ROOT)}")
+            else -> return null
+        }
+        return if (relativePath.isEmpty()) {
+            root.absolutePath
+        } else {
+            File(root, relativePath).absolutePath
+        }
+    }
+
+    private fun createUniqueCacheDirectory(name: String): File {
+        val parent = ensureCacheDirectory(PICKED_DIRECTORY_CACHE)
+        for (attempt in 0 until MAX_UNIQUE_NAME_ATTEMPTS) {
+            val candidate = File(parent, AndroidBridgeUtils.uniqueName(name, attempt))
+            if (candidate.mkdir()) return candidate
+        }
+        throw IOException("Cannot create a unique temporary directory")
+    }
+
+    private fun createUniqueCacheFile(name: String): File {
+        val parent = ensureCacheDirectory(PICKED_FILE_CACHE)
+        for (attempt in 0 until MAX_UNIQUE_NAME_ATTEMPTS) {
+            val candidate = File(parent, AndroidBridgeUtils.uniqueName(name, attempt))
+            if (candidate.createNewFile()) return candidate
+        }
+        throw IOException("Cannot create a unique temporary file")
+    }
+
+    private fun ensureCacheDirectory(name: String): File {
+        val directory = File(cacheDir, name)
+        if (!directory.mkdirs() && !directory.isDirectory) {
+            throw IOException("Cannot create the picker cache")
+        }
+        return directory
     }
 
     private fun hasStoragePermission(): Boolean {
         return if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            ContextCompat.checkSelfPermission(
+            val readGranted = ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED && ContextCompat.checkSelfPermission(
+            ) == PackageManager.PERMISSION_GRANTED
+            val writeGranted = ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
+            val supportsLegacyAccess = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+                Environment.isExternalStorageLegacy()
+            readGranted && writeGranted && supportsLegacyAccess
         } else {
             Environment.isExternalStorageManager()
         }
     }
 
     private fun requestStoragePermission(result: (Boolean) -> Unit) {
+        storagePermissionRequests.add(result)
+        if (storagePermissionInFlight) return
+        if (hasStoragePermission()) {
+            finishStoragePermissionRequest(true)
+            return
+        }
+        storagePermissionInFlight = true
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            val readPermission = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-
-            val writePermission = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (!readPermission || !writePermission) {
-                storagePermissionRequest = result
+            try {
                 ActivityCompat.requestPermissions(
                     this,
                     arrayOf(
@@ -471,25 +553,45 @@ class MainActivity : FlutterFragmentActivity() {
                     ),
                     storageRequestCode
                 )
-            } else {
-                result(true)
+            } catch (error: Exception) {
+                finishStoragePermissionRequest(false)
             }
         } else {
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                    intent.addCategory("android.intent.category.DEFAULT")
-                    intent.data = Uri.parse("package:$packageName")
-                    startContractForResult(ActivityResultContracts.StartActivityForResult(), intent){ _ ->
-                        result(Environment.isExternalStorageManager())
-                    }
-                } catch (e: Exception) {
-                    result(false)
-                }
-            } else {
-                result(true)
-            }
+            launchStorageSettings(appSpecific = true)
         }
+    }
+
+    @TargetApi(Build.VERSION_CODES.R)
+    private fun launchStorageSettings(appSpecific: Boolean) {
+        val intent = if (appSpecific) {
+            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                addCategory(Intent.CATEGORY_DEFAULT)
+                data = Uri.parse("package:$packageName")
+            }
+        } else {
+            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+        }
+        startContractForResult(
+            contract = ActivityResultContracts.StartActivityForResult(),
+            input = intent,
+            callback = {
+                finishStoragePermissionRequest(Environment.isExternalStorageManager())
+            },
+            onLaunchError = {
+                if (appSpecific) {
+                    launchStorageSettings(appSpecific = false)
+                } else {
+                    finishStoragePermissionRequest(false)
+                }
+            }
+        )
+    }
+
+    private fun finishStoragePermissionRequest(granted: Boolean) {
+        storagePermissionInFlight = false
+        val callbacks = storagePermissionRequests.toList()
+        storagePermissionRequests.clear()
+        for (callback in callbacks) callback(granted)
     }
 
     override fun onRequestPermissionsResult(
@@ -499,69 +601,137 @@ class MainActivity : FlutterFragmentActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == storageRequestCode) {
-            storagePermissionRequest?.invoke(grantResults.all {
-                it == PackageManager.PERMISSION_GRANTED
-            })
-            storagePermissionRequest = null
+            finishStoragePermissionRequest(hasStoragePermission())
         }
     }
 
     private fun openFile(result: MethodChannel.Result, mimeType: String) {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-        intent.addCategory(Intent.CATEGORY_OPENABLE)
-        intent.type = mimeType
-        startContractForResult(ActivityResultContracts.StartActivityForResult(), intent){ activityResult ->
-            if (activityResult.resultCode != Activity.RESULT_OK) {
-                result.success(null)
-                return@startContractForResult
-            }
-            val uri = activityResult.data?.data
-            if (uri == null) {
-                result.success(null)
-                return@startContractForResult
-            }
-            val contentResolver = contentResolver
-            val file = DocumentFile.fromSingleUri(this, uri)
-            if (file == null) {
-                result.success(null)
-                return@startContractForResult
-            }
-            val fileName = file.name
-            if (fileName == null) {
-                result.success(null)
-                return@startContractForResult
-            }
-            if(hasStoragePermission()) {
-                try {
-                    val filePath = FileUtils.getPathFromUri(this, uri)
-                    result.success(filePath)
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            type = mimeType
+        }
+        startContractForResult(
+            contract = ActivityResultContracts.StartActivityForResult(),
+            input = intent,
+            callback = { activityResult ->
+                if (activityResult.resultCode != Activity.RESULT_OK) {
+                    result.success(null)
                     return@startContractForResult
                 }
-                catch (e: Exception) {
-                    // ignore
+                val uri = activityResult.data?.data
+                if (uri == null) {
+                    result.success(null)
+                    return@startContractForResult
+                }
+                copySelectedFile(uri, result)
+            },
+            onLaunchError = { error ->
+                result.error("picker unavailable", error.message, null)
+            }
+        )
+    }
+
+    private fun copySelectedFile(uri: Uri, result: MethodChannel.Result) {
+        submitIo(
+            onRejected = {
+                result.error("copy error", "The file worker is unavailable", null)
+            }
+        ) {
+            var destination: File? = null
+            try {
+                if (hasStoragePermission()) {
+                    try {
+                        val directFile = File(FileUtils.getPathFromUri(this, uri))
+                        if (directFile.isFile && directFile.canRead()) {
+                            val directPath = directFile.absolutePath
+                            completeOnMain { result.success(directPath) }
+                            return@submitIo
+                        }
+                    } catch (error: Exception) {
+                        // Some providers cannot expose a dart:io path. Copy below instead.
+                    }
+                }
+
+                val document = DocumentFile.fromSingleUri(this, uri)
+                    ?: throw IOException("Cannot access the selected file")
+                val fileName = AndroidBridgeUtils.safeDocumentName(document.name)
+                    ?: throw IOException("Selected file has no valid name")
+                val copyDestination = createUniqueCacheFile(fileName)
+                destination = copyDestination
+                val inputStream = contentResolver.openInputStream(uri)
+                    ?: throw IOException("Cannot read the selected file")
+                inputStream.use { input ->
+                    FileOutputStream(copyDestination).use { output ->
+                        input.copyTo(output, bufferSize = COPY_BUFFER_SIZE)
+                        output.flush()
+                    }
+                }
+                val copiedPath = copyDestination.absolutePath
+                completeOnMain { result.success(copiedPath) }
+            } catch (error: Exception) {
+                destination?.delete()
+                completeOnMain {
+                    result.error("copy error", error.message ?: "Cannot copy file", null)
                 }
             }
-            // use copy method
-            val tmp = File(cacheDir, fileName)
-            if(tmp.exists()) {
-                tmp.delete()
-            }
-            Log.i("Venera", "copy file (${fileName}) to ${tmp.absolutePath}")
-            Thread {
+        }
+    }
+
+    private fun submitIo(onRejected: () -> Unit, operation: () -> Unit) {
+        try {
+            ioExecutor.execute { operation() }
+        } catch (error: RejectedExecutionException) {
+            completeOnMain(onRejected)
+        }
+    }
+
+    private fun completeOnMain(action: () -> Unit) {
+        val guardedAction = Runnable {
+            if (!activityDestroyed) action()
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            guardedAction.run()
+        } else {
+            mainHandler.post(guardedAction)
+        }
+    }
+
+    private fun prunePickerCacheAsync() {
+        submitIo(onRejected = {}) {
+            val cutoff = System.currentTimeMillis() - PICKER_CACHE_RETENTION_MS
+            for (cacheName in arrayOf(PICKED_FILE_CACHE, PICKED_DIRECTORY_CACHE)) {
+                val pickerCache = File(cacheDir, cacheName)
                 try {
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(tmp).use { output ->
-                            input.copyTo(output, bufferSize = DEFAULT_BUFFER_SIZE)
-                            output.flush()
+                    pickerCache.listFiles()?.forEach { entry ->
+                        if (entry.lastModified() in 1 until cutoff) {
+                            entry.deleteRecursively()
                         }
                     }
-                    result.success(tmp.absolutePath)
+                } catch (error: Exception) {
+                    Log.w("VeneraPicker", "Cannot prune stale picker cache", error)
                 }
-                catch (e: Exception) {
-                    result.error("copy error", e.message, null)
-                }
-            }.start()
+            }
         }
+    }
+
+    override fun onDestroy() {
+        activityDestroyed = true
+        listening = false
+        volumeListen.clear()
+        textShareHandler = null
+        storagePermissionRequests.clear()
+        storagePermissionInFlight = false
+        ioExecutor.shutdownNow()
+        mainHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        listening = false
+        volumeListen.clear()
+        textShareHandler = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 
     companion object {
@@ -569,6 +739,14 @@ class MainActivity : FlutterFragmentActivity() {
         private const val PRIMARY_STORAGE_ROOT = "/storage/emulated/0"
         private const val EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY =
             "com.android.externalstorage.documents"
+        private const val PICKED_FILE_CACHE = "venera-picked-files"
+        private const val PICKED_DIRECTORY_CACHE = "venera-picked-directories"
+        private const val COPY_BUFFER_SIZE = 64 * 1024
+        private const val MAX_DIRECTORY_DEPTH = 64
+        private const val MAX_UNIQUE_NAME_ATTEMPTS = 1000
+        private const val MAX_QUEUED_SHARED_TEXTS = 32
+        private const val PICKER_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
+        private val REMOVABLE_VOLUME_ID = Regex("^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$")
         private val REMOVABLE_STORAGE_PATH =
             Regex("^/storage/([0-9A-Fa-f]{4}-[0-9A-Fa-f]{4})(?:/(.*))?$")
     }
@@ -577,12 +755,18 @@ class MainActivity : FlutterFragmentActivity() {
 class VolumeListen {
     var onUp = fun() {}
     var onDown = fun() {}
+
     fun up() {
         onUp()
     }
 
     fun down() {
         onDown()
+    }
+
+    fun clear() {
+        onUp = {}
+        onDown = {}
     }
 }
 

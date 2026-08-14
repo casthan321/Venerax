@@ -243,6 +243,8 @@ class _GalleryModeState extends State<_GalleryMode>
 
   var photoViewControllers = <int, PhotoViewController>{};
 
+  late final ReaderImagePreloadTracker _preloadTracker;
+
   late _ReaderState reader;
 
   bool get showChapterCommentsAtEnd {
@@ -291,13 +293,32 @@ class _GalleryModeState extends State<_GalleryMode>
 
   @override
   void initState() {
+    super.initState();
     reader = context.reader;
     controller = PageController(initialPage: reader.page);
+    _preloadTracker = ReaderImagePreloadTracker(reader.images!.length);
     reader._imageViewController = this;
     Future.microtask(() {
-      context.readerScaffold.setFloatingButton(0);
+      if (mounted) context.readerScaffold.setFloatingButton(0);
     });
-    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) cache(reader.page);
+    });
+  }
+
+  @override
+  void dispose() {
+    keyRepeatTimer?.cancel();
+    controller.dispose();
+    for (final photoViewController in photoViewControllers.values) {
+      photoViewController.dispose();
+    }
+    photoViewControllers.clear();
+    imageStates.clear();
+    if (identical(reader._imageViewController, this)) {
+      reader._imageViewController = null;
+    }
+    super.dispose();
   }
 
   /// Get the range of images for the given page. [page] is 1-based.
@@ -350,10 +371,30 @@ class _GalleryModeState extends State<_GalleryMode>
     if (isChapterCommentsPage(page)) return;
     var (startIndex, endIndex) = getPageImagesRange(page);
     for (int i = startIndex; i < endIndex; i++) {
-      shouldPreCache
-          ? _precacheImage(i + 1, context)
-          : _preDownloadImage(i + 1, context);
+      final imagePage = i + 1;
+      if (shouldPreCache) {
+        if (_preloadTracker.requestPrecache(imagePage)) {
+          _precacheImage(imagePage, context);
+        }
+      } else if (_preloadTracker.requestDownload(imagePage)) {
+        _preDownloadImage(imagePage, context);
+      }
     }
+  }
+
+  void _prunePhotoViewControllers() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      // Read the live page here rather than capturing onPageChanged's value:
+      // multiple rapid jumps can queue callbacks in the same frame.
+      final distantPages = galleryControllerPagesToEvict(
+        controllerPages: photoViewControllers.keys,
+        currentPage: reader.page,
+      ).toList(growable: false);
+      for (final page in distantPages) {
+        photoViewControllers.remove(page)?.dispose();
+      }
+    });
   }
 
   Widget _buildChapterCommentsPage() {
@@ -478,8 +519,6 @@ class _GalleryModeState extends State<_GalleryMode>
               endIndex,
             );
 
-            cache(index);
-
             photoViewControllers[index] ??= PhotoViewController();
 
             if (reader.imagesPerPage == 1 || pageImages.length == 1) {
@@ -555,17 +594,12 @@ class _GalleryModeState extends State<_GalleryMode>
             }
           } else {
             reader.setPage(i);
+            cache(i);
+            _prunePhotoViewControllers();
             context.readerScaffold.update();
             // Auto close toolbar when entering chapter comments page
             if (isChapterCommentsPage(i) && context.readerScaffold.isOpen) {
               context.readerScaffold.openOrClose();
-            }
-          }
-          // Remove other pages' controllers to reset their state.
-          var keys = photoViewControllers.keys.toList();
-          for (var key in keys) {
-            if (key != i) {
-              photoViewControllers.remove(key);
             }
           }
         },
@@ -881,12 +915,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
   ScrollController get scrollController => _scrollController!;
 
   var isCTRLPressed = false;
-  static var _isMouseScrolling = false;
+  bool _isMouseScrolling = false;
   var fingers = 0;
   bool disableScroll = false;
 
-  late List<bool> preDownloadRequested;
-  late List<bool> preCacheRequested;
+  late final ReaderImagePreloadTracker _preloadTracker;
 
   int get preCacheCount => appdata.settings["preloadImageCount"];
 
@@ -904,21 +937,26 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   void initState() {
+    super.initState();
     reader = context.reader;
     reader._imageViewController = this;
     itemPositionsListener.itemPositions.addListener(onPositionChanged);
-    preDownloadRequested = List.filled(reader.maxPage + 2, false);
-    preCacheRequested = List.filled(reader.maxPage + 2, false);
+    _preloadTracker = ReaderImagePreloadTracker(reader.images!.length);
     Future.delayed(const Duration(milliseconds: 100), () {
       if (mounted) cacheImages(reader.page);
     });
-    super.initState();
   }
 
   @override
   void dispose() {
     itemPositionsListener.itemPositions.removeListener(onPositionChanged);
+    _scrollController?.removeListener(onScroll);
     _scrollTapGuard.dispose();
+    photoViewController.dispose();
+    imageStates.clear();
+    if (identical(reader._imageViewController, this)) {
+      reader._imageViewController = null;
+    }
     super.dispose();
   }
 
@@ -926,8 +964,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
     if (itemPositionsListener.itemPositions.value.isEmpty) {
       return;
     }
-    var page = itemPositionsListener.itemPositions.value.first.index;
-    page = page.clamp(1, reader.maxPage);
+    final page = selectDominantContinuousPage(
+      positions: itemPositionsListener.itemPositions.value,
+      currentPage: reader.page,
+      maxPage: reader.maxPage,
+    );
     if (page != reader.page) {
       reader.setPage(page);
       context.readerScaffold.update();
@@ -969,14 +1010,18 @@ class _ContinuousModeState extends State<_ContinuousMode>
         duration = Duration(milliseconds: 10);
       }
     }
-    scrollController
-        .animateTo(_futurePosition!, duration: duration, curve: Curves.linear)
-        .then((_) {
-          var current = scrollController.position.pixels;
-          if (current == target && current == _futurePosition) {
-            _futurePosition = null;
-          }
-        });
+    final activeScrollController = scrollController;
+    unawaited(
+      activeScrollController
+          .animateTo(_futurePosition!, duration: duration, curve: Curves.linear)
+          .then((_) {
+            if (!mounted || !activeScrollController.hasClients) return;
+            var current = activeScrollController.position.pixels;
+            if (current == target && current == _futurePosition) {
+              _futurePosition = null;
+            }
+          }),
+    );
   }
 
   void onPointerSignal(PointerSignalEvent event) {
@@ -1000,18 +1045,15 @@ class _ContinuousModeState extends State<_ContinuousMode>
       preloadCount: preCacheCount,
     );
     final preCachePage = plan.preCachePage;
-    if (preCachePage != null && !preCacheRequested[preCachePage]) {
+    if (preCachePage != null && _preloadTracker.requestPrecache(preCachePage)) {
       // Decoding the nearest page before it enters the viewport avoids the
       // placeholder-to-image relayout and texture upload landing on the same
       // frame as the user's scroll. Keep this to one page to bound memory.
       _precacheImage(preCachePage, context);
-      preCacheRequested[preCachePage] = true;
-      preDownloadRequested[preCachePage] = true;
     }
     for (final page in plan.preDownloadPages) {
-      if (!preDownloadRequested[page]) {
+      if (_preloadTracker.requestDownload(page)) {
         _preDownloadImage(page, context);
-        preDownloadRequested[page] = true;
       }
     }
   }

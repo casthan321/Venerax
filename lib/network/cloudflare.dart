@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' as io;
 
 import 'package:dio/dio.dart';
@@ -7,14 +8,49 @@ import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/webview.dart';
-import 'package:venera/utils/ext.dart';
 
+import 'cloudflare_detection.dart';
 import 'cookie_jar.dart';
 
-class CloudflareException implements DioException {
-  final String url;
+class CloudflareException extends DioException {
+  CloudflareException._({
+    required super.requestOptions,
+    required this.challengeUri,
+    required this.navigationUri,
+    super.response,
+    super.error,
+    super.stackTrace,
+    super.type = DioExceptionType.badResponse,
+    super.message = 'Cloudflare verification required',
+  });
 
-  CloudflareException(this.url);
+  factory CloudflareException.fromResponse(Response<dynamic> response) {
+    final navigationUri = challengeNavigationUri(response.requestOptions.uri);
+    return CloudflareException._(
+      requestOptions: response.requestOptions,
+      challengeUri: safeChallengeUri(navigationUri),
+      navigationUri: navigationUri,
+      response: response,
+    );
+  }
+
+  factory CloudflareException.fromUrl(String url) {
+    final navigationUri = challengeNavigationUri(Uri.parse(url));
+    final uri = safeChallengeUri(navigationUri);
+    return CloudflareException._(
+      requestOptions: RequestOptions(path: uri.toString()),
+      challengeUri: uri,
+      navigationUri: navigationUri,
+    );
+  }
+
+  final Uri challengeUri;
+
+  /// Full in-process navigation target. Never include this in diagnostics: a
+  /// query may contain source-specific state or credentials.
+  final Uri navigationUri;
+
+  String get url => challengeUri.toString();
 
   @override
   String toString() {
@@ -22,42 +58,41 @@ class CloudflareException implements DioException {
   }
 
   static CloudflareException? fromString(String message) {
-    var match = RegExp(r"CloudflareException: (.+)").firstMatch(message);
+    final match = RegExp(
+      r'^CloudflareException: (https?://\S+)$',
+    ).firstMatch(message.trim());
     if (match == null) return null;
-    return CloudflareException(match.group(1)!);
+    try {
+      return CloudflareException.fromUrl(match.group(1)!);
+    } catch (_) {
+      return null;
+    }
   }
 
   @override
-  DioException copyWith(
-      {RequestOptions? requestOptions,
-      Response<dynamic>? response,
-      DioExceptionType? type,
-      Object? error,
-      StackTrace? stackTrace,
-      String? message}) {
-    return this;
+  CloudflareException copyWith({
+    RequestOptions? requestOptions,
+    Response<dynamic>? response,
+    DioExceptionType? type,
+    Object? error,
+    StackTrace? stackTrace,
+    String? message,
+  }) {
+    final nextRequest = requestOptions ?? this.requestOptions;
+    final nextNavigationUri = requestOptions == null
+        ? navigationUri
+        : challengeNavigationUri(nextRequest.uri);
+    return CloudflareException._(
+      requestOptions: nextRequest,
+      challengeUri: safeChallengeUri(nextNavigationUri),
+      navigationUri: nextNavigationUri,
+      response: response ?? this.response,
+      type: type ?? this.type,
+      error: error ?? this.error,
+      stackTrace: stackTrace ?? this.stackTrace,
+      message: message ?? this.message,
+    );
   }
-
-  @override
-  Object? get error => this;
-
-  @override
-  String? get message => toString();
-
-  @override
-  RequestOptions get requestOptions => RequestOptions();
-
-  @override
-  Response? get response => null;
-
-  @override
-  StackTrace get stackTrace => StackTrace.empty;
-
-  @override
-  DioExceptionType get type => DioExceptionType.badResponse;
-
-  @override
-  DioExceptionReadableStringBuilder? stringBuilder;
 }
 
 class CloudflareInterceptor extends Interceptor {
@@ -70,153 +105,220 @@ class CloudflareInterceptor extends Interceptor {
   }
 
   @override
-  void onError(DioException err, ErrorInterceptorHandler handler) async {
-    if (err.response?.statusCode == 403) {
-      handler.next(_check(err.response!) ?? err);
-    } else {
-      handler.next(err);
-    }
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    final response = err.response;
+    handler.next(response == null ? err : _check(response) ?? err);
   }
 
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) {
-    if (response.statusCode == 403) {
-      var err = _check(response);
-      if (err != null) {
-        handler.reject(err);
-        return;
-      }
+    final err = _check(response);
+    if (err != null) {
+      handler.reject(err);
+      return;
     }
     handler.next(response);
   }
 
   CloudflareException? _check(Response response) {
-    if (response.headers['cf-mitigated']?.firstOrNull == "challenge") {
-      return CloudflareException(response.requestOptions.uri.toString());
+    if (isCloudflareChallengeResponse(
+      statusCode: response.statusCode,
+      headers: response.headers.map,
+      body: response.data,
+    )) {
+      return CloudflareException.fromResponse(response);
     }
     return null;
   }
 }
 
-void passCloudflare(CloudflareException e, void Function() onFinished) async {
-  var url = e.url;
-  var uri = Uri.parse(url);
+final Map<String, _CloudflarePassFlight> _activeCloudflarePasses = {};
 
-  void saveCookies(Map<String, String> cookies) {
-    var domain = uri.host;
-    var splits = domain.split('.');
-    if (splits.length > 1) {
-      domain = ".${splits[splits.length - 2]}.${splits[splits.length - 1]}";
-    }
-    SingleInstanceCookieJar.instance!.saveFromResponse(
-      uri,
-      List<io.Cookie>.generate(cookies.length, (index) {
-        var cookie = io.Cookie(
-            cookies.keys.elementAt(index), cookies.values.elementAt(index));
-        cookie.domain = domain;
-        return cookie;
-      }),
-    );
+class _CloudflarePassFlight {
+  _CloudflarePassFlight(Uri uri) : future = _performCloudflarePass(uri);
+
+  final Future<bool> future;
+  final List<void Function()> _callbacks = [];
+  bool _callbacksRun = false;
+
+  void addCallback(void Function() callback) {
+    if (_callbacks.any((existing) => identical(existing, callback))) return;
+    _callbacks.add(callback);
+    if (_callbacksRun) _runCallback(callback);
   }
 
-  // windows version of package `flutter_inappwebview` cannot get some cookies
-  // Using DesktopWebview instead
+  Future<void> complete() async {
+    if (!await future || _callbacksRun) return;
+    _callbacksRun = true;
+    for (final callback in List<void Function()>.of(_callbacks)) {
+      _runCallback(callback);
+    }
+  }
+
+  void _runCallback(void Function() callback) {
+    try {
+      callback();
+    } catch (_, stackTrace) {
+      Log.error('Cloudflare', 'Retry callback failed', stackTrace);
+    }
+  }
+}
+
+/// Opens one verification window per origin. Closing the window is a
+/// cancellation and deliberately does not retry the failed network request.
+Future<void> passCloudflare(
+  CloudflareException exception,
+  void Function() onFinished,
+) async {
+  final uri = exception.navigationUri;
+  final key = '${uri.scheme}://${uri.host}:${uri.port}';
+  final pass = _activeCloudflarePasses.putIfAbsent(
+    key,
+    () => _CloudflarePassFlight(uri),
+  );
+  pass.addCallback(onFinished);
+  try {
+    await pass.complete();
+  } catch (_, stackTrace) {
+    Log.error('Cloudflare', 'Verification could not be completed', stackTrace);
+  } finally {
+    if (identical(_activeCloudflarePasses[key], pass)) {
+      _activeCloudflarePasses.remove(key);
+    }
+  }
+}
+
+Future<bool> _performCloudflarePass(Uri uri) async {
+  final url = uri.toString();
+
+  // flutter_inappwebview is unavailable on Linux, so use the desktop window.
   if (App.isLinux) {
-    var webview = DesktopWebview(
-      initialUrl: url,
-      onTitleChange: (title, controller) async {
-        var head =
-            await controller.evaluateJavascript("document.head.innerHTML") ??
-                "";
-        var body =
-            await controller.evaluateJavascript("document.body.innerHTML") ??
-                "";
-        Log.info("Cloudflare", "Checking head: $head");
-        var isChallenging = head.contains('#challenge-success-text') ||
-            head.contains("#challenge-error-text") ||
-            head.contains("#challenge-form") ||
-            body.contains("challenge-platform") ||
-            body.contains("window._cf_chl_opt");
-        if (!isChallenging) {
-          Log.info(
-            "Cloudflare",
-            "Cloudflare is passed due to there is no challenge css",
-          );
-          var ua = controller.userAgent;
-          if (ua != null) {
-            appdata.implicitData['ua'] = ua;
-            appdata.writeImplicitData();
-          }
-          var cookiesMap = await controller.getCookies(url);
-          if (cookiesMap['cf_clearance'] == null) {
-            return;
-          }
-          saveCookies(cookiesMap);
-          controller.close();
-          onFinished();
-        }
-      },
-      onClose: onFinished,
-    );
-    webview.open();
-  } else {
-    bool success = false;
-    void check(InAppWebViewController controller) async {
-      var head = await controller.evaluateJavascript(
-          source: "document.head.innerHTML") as String;
-      var body = await controller.evaluateJavascript(
-          source: "document.body.innerHTML") as String;
-      Log.info("Cloudflare", "Checking head: $head");
-      var isChallenging = head.contains('#challenge-success-text') ||
-          head.contains("#challenge-error-text") ||
-          head.contains("#challenge-form") ||
-          body.contains("challenge-platform") ||
-          body.contains("window._cf_chl_opt");
-      if (!isChallenging) {
-        Log.info(
-          "Cloudflare",
-          "Cloudflare is passed due to there is no challenge css",
+    final result = Completer<bool>();
+    var checking = false;
+    late final DesktopWebview webview;
+
+    Future<void> check(DesktopWebview controller) async {
+      if (checking || result.isCompleted) return;
+      checking = true;
+      try {
+        final currentUri = Uri.tryParse(controller.currentUrl ?? '');
+        if (currentUri == null || !haveSameWebOrigin(uri, currentUri)) return;
+        final isChallenging = _javascriptBoolean(
+          await controller.evaluateJavascript(_challengeProbe),
         );
-        var ua = await controller.getUA();
-        if (ua != null) {
+        if (isChallenging) return;
+        final clearance = (await controller.getCookies(
+          currentUri.toString(),
+        ))['cf_clearance'];
+        if (clearance == null || clearance.isEmpty) return;
+
+        _saveClearanceCookie(uri, clearance);
+        final ua = controller.userAgent;
+        if (ua != null && ua.isNotEmpty) {
           appdata.implicitData['ua'] = ua;
           appdata.writeImplicitData();
         }
-        var cookies = await controller.getCookies(url) ?? [];
-        if (cookies.firstWhereOrNull(
-                (element) => element.name == 'cf_clearance') ==
-            null) {
-          return;
-        }
-        SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
-        if (!success) {
-          App.rootPop();
-          success = true;
-        }
+        result.complete(true);
+        controller.close();
+      } catch (_, stackTrace) {
+        Log.error('Cloudflare', 'Verification check failed', stackTrace);
+      } finally {
+        checking = false;
       }
     }
 
+    webview = DesktopWebview(
+      initialUrl: url,
+      onTitleChange: (_, controller) => check(controller),
+      onClose: () {
+        if (!result.isCompleted) result.complete(false);
+      },
+    );
+    await webview.open();
+    return result.future;
+  }
+
+  final result = Completer<bool>();
+  var checking = false;
+
+  Future<void> check(InAppWebViewController controller) async {
+    if (checking || result.isCompleted) return;
+    checking = true;
+    try {
+      final currentUri = Uri.tryParse((await controller.getUrl()).toString());
+      if (currentUri == null || !haveSameWebOrigin(uri, currentUri)) return;
+      final isChallenging = _javascriptBoolean(
+        await controller.evaluateJavascript(source: _challengeProbe),
+      );
+      if (isChallenging) return;
+
+      final cookies = await controller.getCookies(currentUri.toString()) ?? [];
+      io.Cookie? clearance;
+      for (final cookie in cookies) {
+        if (cookie.name == 'cf_clearance' && cookie.value.isNotEmpty) {
+          clearance = cookie;
+          break;
+        }
+      }
+      if (clearance == null) return;
+
+      _saveClearanceCookie(uri, clearance.value);
+      final ua = await controller.getUA();
+      if (ua != null && ua.isNotEmpty) {
+        appdata.implicitData['ua'] = ua;
+        appdata.writeImplicitData();
+      }
+      result.complete(true);
+      App.rootPop();
+    } catch (_, stackTrace) {
+      Log.error('Cloudflare', 'Verification check failed', stackTrace);
+    } finally {
+      checking = false;
+    }
+  }
+
+  try {
     await App.rootContext.to(
       () => AppWebview(
         initialUrl: url,
         singlePage: true,
-        onTitleChange: (title, controller) async {
-          check(controller);
-        },
-        onLoadStop: (controller) async {
-          check(controller);
-        },
+        onTitleChange: (_, controller) => check(controller),
+        onLoadStop: check,
         onStarted: (controller) async {
-          var ua = await controller.getUA();
-          if (ua != null) {
+          final ua = await controller.getUA();
+          if (ua != null && ua.isNotEmpty) {
             appdata.implicitData['ua'] = ua;
             appdata.writeImplicitData();
           }
-          var cookies = await controller.getCookies(url) ?? [];
-          SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
         },
       ),
     );
-    onFinished();
+  } catch (_, stackTrace) {
+    Log.error('Cloudflare', 'Verification window failed', stackTrace);
   }
+  if (!result.isCompleted) result.complete(false);
+  return result.future;
 }
+
+void _saveClearanceCookie(Uri uri, String value) {
+  final cookie = io.Cookie('cf_clearance', value)
+    ..path = '/'
+    ..secure = true
+    ..httpOnly = true;
+  SingleInstanceCookieJar.instance?.saveFromResponse(uri, [cookie]);
+}
+
+bool _javascriptBoolean(Object? value) {
+  if (value is bool) return value;
+  final text = value?.toString().trim().toLowerCase();
+  return text == 'true' || text == '"true"' || text == "'true'";
+}
+
+const _challengeProbe = '''
+(() => Boolean(
+  document.querySelector(
+    '#challenge-form, [id^="cf-chl"], '
+    'script[src*="/cdn-cgi/challenge-platform/"]'
+  ) || typeof window._cf_chl_opt !== 'undefined'
+))()
+''';

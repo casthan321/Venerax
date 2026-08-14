@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -6,8 +7,31 @@ import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/data_sync.dart';
+import 'package:venera/utils/atomic_file.dart';
+import 'package:venera/utils/coalescing_async_writer.dart';
 import 'package:venera/utils/init.dart';
 import 'package:venera/utils/io.dart';
+
+@visibleForTesting
+Map<String, dynamic> mergeLocalAppdataForRestore(
+  Map<String, dynamic> current,
+  Map<String, dynamic> imported,
+) {
+  final currentSettings = current['settings'];
+  final mergedSettings = currentSettings is Map
+      ? Map<String, dynamic>.from(currentSettings)
+      : <String, dynamic>{};
+  final importedSettings = imported['settings'];
+  if (importedSettings is Map) {
+    mergedSettings.addAll(Map<String, dynamic>.from(importedSettings));
+  }
+  return <String, dynamic>{
+    'settings': mergedSettings,
+    'searchHistory': List<dynamic>.from(
+      imported['searchHistory'] ?? current['searchHistory'] ?? const [],
+    ),
+  };
+}
 
 class Appdata with Init {
   Appdata._create();
@@ -16,38 +40,59 @@ class Appdata with Init {
 
   var searchHistory = <String>[];
 
-  bool _isSavingData = false;
+  late final CoalescingAsyncWriter<_AppdataWrite> _appdataWriter =
+      CoalescingAsyncWriter<_AppdataWrite>(
+        _writeAppdata,
+        mergePending: (pending, next) => _AppdataWrite(
+          data: next.data,
+          syncData: next.syncData,
+          syncRequested: pending.syncRequested || next.syncRequested,
+        ),
+      );
 
-  Future<void> saveData([bool sync = true]) async {
-    while (_isSavingData) {
-      await Future.delayed(const Duration(milliseconds: 20));
-    }
-    _isSavingData = true;
-    try {
-      var futures = <Future>[];
-      var json = toJson();
-      var data = jsonEncode(json);
-      var file = File(FilePath.join(App.dataPath, 'appdata.json'));
-      futures.add(file.writeAsString(data));
+  late final CoalescingAsyncWriter<String> _implicitDataWriter =
+      CoalescingAsyncWriter<String>(_writeImplicitDataSnapshot);
 
-      var disableSyncFields = json["settings"]["disableSyncFields"] as String;
-      if (disableSyncFields.isNotEmpty) {
-        var json4sync = jsonDecode(data);
-        List<String> customDisableSync = splitField(disableSyncFields);
-        for (var field in customDisableSync) {
-          json4sync["settings"].remove(field);
-        }
-        var data4sync = jsonEncode(json4sync);
-        var file4sync = File(FilePath.join(App.dataPath, 'syncdata.json'));
-        futures.add(file4sync.writeAsString(data4sync));
-      }
+  Future<void> saveData([bool sync = true]) {
+    final json = toJson();
+    final data = jsonEncode(json);
+    late final String syncData;
+    final disableSyncFieldsValue = json["settings"]["disableSyncFields"];
+    final disableSyncFields = disableSyncFieldsValue is String
+        ? disableSyncFieldsValue
+        : '';
+    final jsonForSync = sanitizedAppdataForSync(
+      json,
+      disabledFields: <String>{
+        ..._disableSync,
+        ...splitField(disableSyncFields),
+      },
+    );
+    syncData = jsonEncode(jsonForSync);
+    return _observePersistence(
+      _appdataWriter.schedule(
+        _AppdataWrite(data: data, syncData: syncData, syncRequested: sync),
+      ),
+      'Failed to persist application settings',
+    );
+  }
 
-      await Future.wait(futures);
-    } finally {
-      _isSavingData = false;
-    }
-    if (sync) {
-      DataSync().uploadData();
+  Future<void> _writeAppdata(_AppdataWrite write) async {
+    final writes = <Future<void>>[
+      writeStringAtomically(
+        File(FilePath.join(App.dataPath, 'appdata.json')),
+        write.data,
+      ),
+    ];
+    writes.add(
+      writeStringAtomically(
+        File(FilePath.join(App.dataPath, 'syncdata.json')),
+        write.syncData,
+      ),
+    );
+    await Future.wait(writes);
+    if (write.syncRequested) {
+      unawaited(DataSync().uploadData());
     }
   }
 
@@ -95,7 +140,7 @@ class Appdata with Init {
   ];
 
   /// Sync data from another device
-  void syncData(Map<String, dynamic> data) {
+  Future<void> syncData(Map<String, dynamic> data, {bool upload = true}) {
     if (data['settings'] is Map) {
       var settings = data['settings'] as Map<String, dynamic>;
 
@@ -110,43 +155,80 @@ class Appdata with Init {
       }
     }
     searchHistory = List.from(data['searchHistory'] ?? []);
-    saveData();
+    return saveData(upload);
+  }
+
+  /// Restores an exact in-memory snapshot after a failed transactional import.
+  /// Device-only values are included because the snapshot originated from this
+  /// same installation rather than from an untrusted remote backup.
+  Future<void> restoreSnapshot(Map<String, dynamic> snapshot) {
+    final snapshotSettings = snapshot['settings'];
+    if (snapshotSettings is Map) {
+      settings._replaceAll(Map<String, dynamic>.from(snapshotSettings));
+    }
+    searchHistory = List<String>.from(snapshot['searchHistory'] ?? const []);
+    return saveData(false);
+  }
+
+  /// Restores a user-selected local backup, including device-only settings.
+  ///
+  /// Older backups may not contain settings introduced by newer versions, so
+  /// imported keys are merged over the current defaults instead of replacing
+  /// the settings map wholesale.
+  Future<void> restoreImportedData(Map<String, dynamic> imported) {
+    final merged = mergeLocalAppdataForRestore(toJson(), imported);
+    settings._replaceAll(Map<String, dynamic>.from(merged['settings'] as Map));
+    searchHistory = List<String>.from(merged['searchHistory'] as List);
+    return saveData(false);
   }
 
   var implicitData = <String, dynamic>{};
 
-  void writeImplicitData() async {
-    while (_isSavingData) {
-      await Future.delayed(const Duration(milliseconds: 20));
-    }
-    _isSavingData = true;
-    try {
-      var file = File(FilePath.join(App.dataPath, 'implicitData.json'));
-      await file.writeAsString(jsonEncode(implicitData));
-    } finally {
-      _isSavingData = false;
-    }
+  Future<void> writeImplicitData() {
+    return _observePersistence(
+      _implicitDataWriter.schedule(jsonEncode(implicitData)),
+      'Failed to persist device state',
+    );
+  }
+
+  Future<void> _observePersistence(Future<void> operation, String message) {
+    // Most setting writes originate in synchronous UI callbacks. Registering
+    // an error listener here prevents an ignored Future from becoming an
+    // unhandled zone error, while returning the original Future still lets
+    // explicit callers await and react to the same failure.
+    unawaited(
+      operation.catchError((Object error, StackTrace stackTrace) {
+        Log.error('Appdata', '$message: $error', stackTrace);
+      }),
+    );
+    return operation;
+  }
+
+  Future<void> _writeImplicitDataSnapshot(String data) {
+    return writeStringAtomically(
+      File(FilePath.join(App.dataPath, 'implicitData.json')),
+      data,
+    );
   }
 
   @override
   Future<void> doInit() async {
     var dataPath = (await getApplicationSupportDirectory()).path;
     var file = File(FilePath.join(dataPath, 'appdata.json'));
-    if (!await file.exists()) {
-      return;
-    }
-    try {
-      var json = jsonDecode(await file.readAsString());
-      for (var key in (json['settings'] as Map<String, dynamic>).keys) {
-        if (json['settings'][key] != null) {
-          settings[key] = json['settings'][key];
+    if (await file.exists()) {
+      try {
+        var json = jsonDecode(await file.readAsString());
+        for (var key in (json['settings'] as Map<String, dynamic>).keys) {
+          if (json['settings'][key] != null) {
+            settings[key] = json['settings'][key];
+          }
         }
+        searchHistory = List.from(json['searchHistory']);
+      } catch (e) {
+        Log.error("Appdata", "Failed to load appdata", e);
+        Log.info("Appdata", "Resetting appdata");
+        file.deleteIgnoreError();
       }
-      searchHistory = List.from(json['searchHistory']);
-    } catch (e) {
-      Log.error("Appdata", "Failed to load appdata", e);
-      Log.info("Appdata", "Resetting appdata");
-      file.deleteIgnoreError();
     }
     if ((settings["deviceId"] as String).isEmpty) {
       settings._data["deviceId"] = const Uuid().v4();
@@ -164,6 +246,33 @@ class Appdata with Init {
       implicitDataFile.deleteIgnoreError();
     }
   }
+}
+
+class _AppdataWrite {
+  const _AppdataWrite({
+    required this.data,
+    required this.syncData,
+    required this.syncRequested,
+  });
+
+  final String data;
+  final String syncData;
+  final bool syncRequested;
+}
+
+@visibleForTesting
+Map<String, dynamic> sanitizedAppdataForSync(
+  Map<String, dynamic> source, {
+  required Iterable<String> disabledFields,
+}) {
+  final copy = jsonDecode(jsonEncode(source)) as Map<String, dynamic>;
+  final settings = copy['settings'];
+  if (settings is Map<String, dynamic>) {
+    for (final field in disabledFields) {
+      settings.remove(field);
+    }
+  }
+  return copy;
 }
 
 final appdata = Appdata._create();
@@ -201,6 +310,7 @@ class Settings with ChangeNotifier {
     'enableLongPressToZoom': true,
     'longPressZoomPosition': "press", // press, center
     'checkUpdateOnStart': false,
+    'receiveBetaUpdates': false,
     'limitImageWidth': true,
     'webdav': [], // empty means not configured
     "disableSyncFields": "", // "field1, field2, ..."
@@ -248,6 +358,13 @@ class Settings with ChangeNotifier {
     if (key != "dataVersion") {
       notifyListeners();
     }
+  }
+
+  void _replaceAll(Map<String, dynamic> values) {
+    _data
+      ..clear()
+      ..addAll(values);
+    notifyListeners();
   }
 
   void setEnabledComicSpecificSettings(
