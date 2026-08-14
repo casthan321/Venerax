@@ -77,7 +77,7 @@ digits (colons are accepted) as `ANDROID_SIGNING_CERT_SHA256`.
 Do not paste secret values into an issue, pull request, release note, workflow
 file, or chat transcript.
 
-## First-release sequence
+## Release sequence
 
 1. Run `dart format`, `flutter analyze`, and `flutter test`.
 2. Build locally with `flutter build apk --release` and verify every APK with
@@ -91,16 +91,16 @@ file, or chat transcript.
 6. Install a second community build with the same certificate and a higher
    version code using `adb install -r`; it must update in place without
    affecting the upstream app.
-7. Push the reviewed `v1.6.5` tag. The Android workflow builds and verifies the
+7. Push the reviewed `v1.7.0` tag. The Android workflow builds and verifies the
    commit, creates a draft release, attaches the universal and ABI-specific
    APKs, `SHA256SUMS`, and the compressed R8 mapping, then publishes the release
    only after every asset has been attached.
 8. Verify the attached checksums and signing-certificate SHA-256 digest again.
    Archive the release's R8 mapping with the source tag.
 
-The universal APK has version code 1650. ABI-specific codes are 1651
-(armeabi-v7a), 1652 (arm64-v8a), and 1653 (x86_64). Keep future codes strictly
-higher across every distribution format; do not publish the debug code 1654 as
+The v1.7.0 universal APK has version code 1710. ABI-specific codes are 1711
+(armeabi-v7a), 1712 (arm64-v8a), and 1713 (x86_64). Keep future codes strictly
+higher across every distribution format; do not publish the debug code 1714 as
 an update candidate.
 
 Temporary or smoke certificates are suitable only for build validation. APKs
