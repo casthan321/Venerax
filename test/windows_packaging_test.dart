@@ -80,4 +80,13 @@ void main() {
     expect(runner, contains('The system owns the bitmap'));
     expect(window, contains('SetWindowPos(hwnd, HWND_TOP'));
   });
+
+  test('Windows build remains compatible with current MSVC coroutines', () {
+    final cmake = File('windows/CMakeLists.txt').readAsStringSync();
+
+    expect(
+      cmake,
+      contains('_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS'),
+    );
+  });
 }

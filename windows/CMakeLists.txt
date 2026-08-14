@@ -41,6 +41,11 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100" /wd4267)
   target_compile_options(${TARGET} PRIVATE /EHsc)
+  # local_auth_windows 2.0.1 still uses C++/WinRT's /await compatibility
+  # path. MSVC 14.51 turns the experimental-coroutine deprecation into a
+  # hard error unless this documented transition macro is defined.
+  target_compile_definitions(${TARGET} PRIVATE
+    "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
 endfunction()
